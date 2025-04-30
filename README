@@ -1,0 +1,14 @@
+# DPHyp join enumeration algorithm for PostgreSQL
+
+This is the implementation of dynamic programming algorithm for join enumeration based on hypergraphs for PostgreSQL.
+
+Currently, not implemented.
+
+Основные моменты:
+1. Для представления множества соединяемых таблиц использую `RelOptInfo` - уже есть инфраструктура
+2. Делаю оптимизацию - обхожу все JOIN предикаты, сразу создаю RelOptInfo для него (т.к. понадобится)
+3. 
+
+Шаги:
+1. Разбор PlannerInfo и других структур в граф запроса
+2. 
