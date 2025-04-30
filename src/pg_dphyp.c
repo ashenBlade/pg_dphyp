@@ -75,6 +75,15 @@ static HTAB *create_dptable(List *base_rels)
 
 static List *get_neighbours(RelOptInfo *rel, Bitmapset *excluded)
 {
+	/* 
+	 * Идея следующая: по факту, все joinclause создают ребра, а можно ли содинить 2 RelOptInfo - решает have_relevant_joinclauses.
+	 * Поэтому:
+	 * 1. Прохожу по всем joininfo, удаляю себя из relids и беру меньший элемент - это будет представитель
+	 * 2. Прохожу по всем классам эквивалентности, которые полностью меня содержат, а затем прохожу по каждому EquivalenceMember в нем - удаляю себя из их relids и беру меньший элемент (если остался).
+	 * 3. Объединяю все что осталось
+	 * 
+	 * Можно ли соединять эти отношения решать уже не мне
+	 */
 	List *neighbours = NIL;
 	ListCell *lc;
 	foreach(lc, rel->joininfo)
