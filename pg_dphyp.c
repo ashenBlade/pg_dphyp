@@ -84,6 +84,110 @@ static inline int bms_first(Bitmapset *bms)
 	return res;
 }
 
+static int us_leader(int *leaders, int a)
+{
+	if (leaders[a] == a)
+		return a;
+	else
+		return leaders[a] = us_leader(leaders, leaders[a]);
+}
+
+static void us_union(int *leaders, int a, int b)
+{
+	int a_leader;
+	int b_leader;
+
+	a_leader = us_leader(leaders, a);
+	b_leader = us_leader(leaders, b);
+
+	leaders[a_leader] = b_leader;
+}
+
+static RelOptInfo *run_implicit_join_path(DPHypContext *context)
+{
+	/* 
+	 * В запросе оказались неявные CROSS JOIN'ы (запятые без JOIN).
+	 * Это может случиться и в случае подзапроса, где каждый JOIN предикат использует внешний параметр.
+	 * В таких случаях, мы используем UNION-SET структуру для нахождения всех
+	 * соединенных отношений (и получаем из RelOptInfo), а затем запускаем DPsize/GEQO для них.
+	 */
+	Bitmapset **disjoint_sets;
+	List *disjoint_relations;
+	ListCell *lc;
+	int *leaders;
+	int num_leaders;
+
+	/* Инициализируем */
+	num_leaders = list_length(context->initial_rels);
+	leaders = palloc(sizeof(int) * num_leaders);
+	for (size_t i = 0; i < num_leaders; i++)
+	{
+		leaders[i] = i;
+	}
+	
+	/* Обхожу все гиперребра и составляю множества */
+	foreach(lc, context->base_hypernodes)
+	{
+		HyperNode *node = (HyperNode *)lfirst(lc);
+		ListCell *lc_edge;
+		foreach(lc_edge, node->hyperedges)
+		{
+			ListCell *lc_vertex;
+			List *edge = (List *)lfirst(lc_edge);
+
+			foreach(lc_vertex, edge)
+			{
+				Bitmapset *vertex = (Bitmapset *)lfirst(lc_vertex);
+				int i = -1;
+				while ((i = bms_next_member(vertex, i)) >= 0)
+				{
+					if (node->representative != i)
+						us_union(leaders, node->representative, i);
+				}
+			}
+		}
+	}
+
+	/* Для каждого лидера создаем его Bitmapset */
+	disjoint_sets = palloc0(sizeof(Bitmapset *) * num_leaders);
+	for (size_t i = 0; i < num_leaders; i++)
+	{
+		int leader = us_leader(leaders, i);
+		if (disjoint_sets[leader] == NULL)
+		{
+			disjoint_sets[leader] = bms_make_singleton(i);
+		}
+		else
+		{
+			disjoint_sets[leader] = bms_add_member(disjoint_sets[leader], i);
+		}
+	}
+	
+	/* Заново проходимся и собираем все RelOptInfo */
+	disjoint_relations = NIL;
+	for (size_t i = 0; i < num_leaders; i++)
+	{
+		HyperNode *hypernode;
+
+		if (disjoint_sets[i] == NULL)
+			continue;
+		
+		hypernode = get_hypernode(context, disjoint_sets[i]);
+		if (hypernode->rel == NULL)
+			elog(ERROR, "failed to create RelOptInfo for disjoint set");
+		
+		disjoint_relations = lappend(disjoint_relations, hypernode->rel);
+	}
+	
+	/* Запускаем обычный алгоритм JOIN для непересекающихся множеств */
+	if (prev_join_search_hook)
+		return prev_join_search_hook(context->root, list_length(disjoint_relations), disjoint_relations);
+	else if (enable_geqo && list_length(disjoint_relations) >= geqo_threshold)
+		return geqo(context->root, list_length(disjoint_relations), disjoint_relations);
+	else
+		return standard_join_search(context->root, list_length(disjoint_relations), disjoint_relations);
+}
+
 /* 
  * Создать Bitmapset со всеми битами от 0 до 'until' включительно
  */
@@ -189,9 +293,6 @@ static Bitmapset *get_neighbors(HyperNode *node, Bitmapset *excluded)
 			}
 			else
 			{
-				// int representative = bms_first(set);
-				// if (bms_is_member(representative, excluded))
-				// 	continue;
 				Bitmapset *filtered;
 
 				filtered = bms_difference(set, excluded);
@@ -699,11 +800,17 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 
 	bms = create_all_bit_set(list_length(initial_rels) - 1);
 	result = hash_search(dptable, &(bms), HASH_FIND, &result_found);
-	if (!result)
-		ereport(ERROR, errmsg("Result not found: implicit join not implemented yet"));
-
-	set_cheapest(result->rel);
-	return result->rel;
+	if (result)
+		return result->rel;
+	
+	/* 
+	 * Union-set - находим все соединенные множества и получаем HyperNode для каждого из них
+	 * затем запускаем старый алгоритм DPsize.
+	 * 
+	 * Это лучше делать с помощью DSU, но пока сделаю через Bitmapset - надо просто протестировать
+	 */
+	
+	return run_implicit_join_path(&context);
 }
 
 void
