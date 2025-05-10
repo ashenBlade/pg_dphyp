@@ -1,10 +1,12 @@
 #include "postgres.h"
 #include "fmgr.h"
 #include "nodes/bitmapset.h"
-#include "utils/builtins.h"
+#include "optimizer/geqo.h"
 #include "optimizer/paths.h"
-#include "utils/hsearch.h"
 #include "optimizer/pathnode.h"
+#include "utils/builtins.h"
+#include "utils/hsearch.h"
+#include "utils/guc.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -67,6 +69,8 @@ typedef struct DPHypContext
 } DPHypContext;
 
 static join_search_hook_type prev_join_search_hook = NULL;
+
+static bool enabled = true;
 
 void _PG_init(void);
 void _PG_fini(void);
@@ -146,7 +150,6 @@ static Bitmapset *get_neighbors(HyperNode *node, Bitmapset *excluded)
 	ListCell *lc;
 	Bitmapset *neighbors = NULL;
 
-	/* TODO: excluded не учитываю */
 	/* Проходимся по всем гиперребрам */
 	foreach (lc, node->hyperedges)
 	{
@@ -159,11 +162,19 @@ static Bitmapset *get_neighbors(HyperNode *node, Bitmapset *excluded)
 			Bitmapset *set = (Bitmapset *)lfirst(lc2);
 			if (bms_overlap(set, node->nodes))
 			{
-				Bitmapset *me_excluded = bms_difference(set, node->nodes);
+				Bitmapset *me_excluded;
 				Bitmapset *without_excluded;
+
+				/* 
+				 * Исключаю себя из Cross Join Set'а
+				 */
+				me_excluded = bms_difference(set, node->nodes);
 				if (bms_is_empty(me_excluded))
 					continue;
-				
+
+				/* 
+				 * Если там кто-то остался, то нужно удалить исключенные
+				 */
 				without_excluded = bms_difference(me_excluded, excluded);
 				if (bms_is_empty(without_excluded))
 				{
@@ -171,17 +182,24 @@ static Bitmapset *get_neighbors(HyperNode *node, Bitmapset *excluded)
 					continue;
 				}
 
-				neighbors = bms_difference(neighbors, without_excluded);
+				/* Со всеми оставшимися узлами у меня есть JOIN ребро */
+				neighbors = bms_union(neighbors, without_excluded);
 				bms_free(me_excluded);
 				bms_free(without_excluded);
 			}
 			else
 			{
-				int representative = bms_first(set);
-				if (bms_is_member(representative, excluded))
+				// int representative = bms_first(set);
+				// if (bms_is_member(representative, excluded))
+				// 	continue;
+				Bitmapset *filtered;
+
+				filtered = bms_difference(set, excluded);
+				if (bms_is_empty(filtered))
 					continue;
 				
-				neighbors = bms_union(neighbors, set);
+				neighbors = bms_union(neighbors, filtered);
+				bms_free(filtered);
 			}
 		}
 	}
@@ -323,6 +341,9 @@ static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, Hype
 
 		bms_free(neighbor_superset);
 	}
+	/* 
+	 * TODO: проследить где я создаю неправильный excluded
+	 */
 
 	/* 
 	 * X = X u N(S_2, X)
@@ -437,18 +458,7 @@ static void enumerate_csg_recursive(DPHypContext *context, HyperNode *node, Bitm
 
 static void solve(DPHypContext *context)
 {
-	ListCell *lc1;
-	ListCell *lc2;
 	int base_hypernodes_count = list_length(context->base_hypernodes);
-
-	/* Создаем планы для готовых отношений */
-	forboth(lc1, context->base_hypernodes, lc2, context->initial_rels)
-	{
-		HyperNode *node = (HyperNode *)lfirst(lc1);
-		RelOptInfo *rel = (RelOptInfo *)lfirst(lc2);
-
-		node->rel = rel;
-	}
 
 	/* Оборачиваем список, чтобы итерироваться в обратном порядке */
 	for (int i = base_hypernodes_count - 1; i >= 0; i--)
@@ -642,6 +652,15 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 	int id;
 	bool result_found;
 
+	if (!enabled)
+	{
+		if (prev_join_search_hook)
+			return prev_join_search_hook(root, levels_needed, initial_rels);
+		if (enable_geqo && levels_needed >= geqo_threshold)
+			return geqo(root, levels_needed, initial_rels);
+		return standard_join_search(root, levels_needed, initial_rels);
+	}
+
 	/* 
 	 * Шаги:
 	 * 1. Каждому RelOptInfo назначаем ID (по факту индекс в массиве)
@@ -690,6 +709,16 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 void
 _PG_init(void)
 {
+
+	DefineCustomBoolVariable("pg_dphyp.enabled",
+							 "pg_dphyp join enumeration algorithm is enabled",
+							 NULL,
+							 &enabled,
+							 enabled,
+							 PGC_USERSET,
+							 0, NULL, NULL, NULL);
+	MarkGUCPrefixReserved("pg_dphyp");
+
 	prev_join_search_hook = join_search_hook;
 	join_search_hook = dphyp_join_search;
 }
