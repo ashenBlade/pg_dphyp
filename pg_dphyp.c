@@ -146,6 +146,7 @@ static Bitmapset *get_neighbors(HyperNode *node, Bitmapset *excluded)
 	ListCell *lc;
 	Bitmapset *neighbors = NULL;
 
+	/* TODO: excluded не учитываю */
 	/* Проходимся по всем гиперребрам */
 	foreach (lc, node->hyperedges)
 	{
@@ -170,7 +171,7 @@ static Bitmapset *get_neighbors(HyperNode *node, Bitmapset *excluded)
 					continue;
 				}
 
-				neighbors = bms_union(neighbors, without_excluded);
+				neighbors = bms_difference(neighbors, without_excluded);
 				bms_free(me_excluded);
 				bms_free(without_excluded);
 			}
@@ -284,7 +285,10 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 	hypernode = get_hypernode(context, nodes);
 
 	joinrel = make_join_rel(context->root, subgroup->rel, complement->rel);
+	if (!joinrel)
+		return;
 
+	set_cheapest(joinrel);
 	/* Лениво инициализируем */
 	if (hypernode->rel == NULL)
         hypernode->rel = joinrel;
@@ -319,7 +323,6 @@ static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, Hype
 
 		bms_free(neighbor_superset);
 	}
-	list_free_deep(neighbors_subsets);
 
 	/* 
 	 * X = X u N(S_2, X)
