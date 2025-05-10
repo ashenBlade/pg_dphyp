@@ -7,6 +7,7 @@
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/guc.h"
+#include "miscadmin.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -693,6 +694,7 @@ static void solve(DPHypContext *context)
 	for (int i = base_hypernodes_count - 1; i >= 0; i--)
 	{
 		HyperNode *node = (HyperNode *) list_nth(context->base_hypernodes, i);
+		CHECK_FOR_INTERRUPTS();
 		emit_csg(context, node);
 		enumerate_csg_recursive(context, node, create_all_bit_set(i));
 	}
