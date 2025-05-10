@@ -352,6 +352,140 @@ static bool hypernode_has_edge_with(HyperNode *node, Bitmapset *bms)
 	return false;
 }
 
+static Bitmapset *create_bms(bitmapword *words, int nwords)
+{
+	Bitmapset *subset;
+
+	subset = (Bitmapset *)palloc(offsetof(Bitmapset, words) + sizeof(bitmapword) * nwords);
+	subset->type = T_Bitmapset;
+	subset->nwords = nwords;
+	
+	for (size_t i = 0; i < nwords; i++)
+	{
+		subset->words[i] = words[i];
+	}
+	
+	return subset;
+}
+
+static List *generate_all_subsets_long(Bitmapset *bms)
+{
+	/* 
+	 * Эта функция используется, когда bms->words больше 1 слова, то есть алгоритм с простым вычитанием тут уже не сработает.
+	 * В таком случае, мы разбиваем задачу по поиску комбинаций для 1 слова, на массив независимых слов.
+	 * 
+	 * То есть алгоритм следующий:
+	 * 1. Храним массив bitmapset[]
+	 * 2. Инициализируем его всеми 0
+	 * 3. bitmapset[0] инициализируем начальным значением: (-init) & init
+	 * 4. Начинаем алгоритм как для обычного перебора
+	 * 5. Как только доходим до 0, то переходим к следующему слову
+	 * 6. Для него запускаем 1 итерацию:
+	 *      - Если 0, то (-init) & init (т.е. инициализируем)
+	 *      - Иначе делаем 1 итерацию
+	 * 7. Если после итерации получили 0, то переходим к следующему слову и делаем шаг 6 для него
+	 * 8. Если на шаге 7 мы достигли последнего слова, то алгоритм заканчивается
+	 * 
+	 * Грубо говоря (очень), мы проводим выполняем сложение длинной арифметики:
+	 * 1. Перебираем первое слово
+	 * 2. Как только получили 0, то итерируем следующее слово (как бы перенос разряда после сложения)
+	 * 3. Лавинно итерируем каждое очередное слово - переносим разряд, пока это возможно
+	 * 4. Если добрались до последнего слова (для него надо сделать перенос) - конец
+	 */
+	bitmapword *words;
+	List *subsets;
+	int start_word;
+
+	words = palloc0(sizeof(bitmapword) * bms->nwords);
+
+	/* 
+	 * Небольшая оптимизация - находим первое слово, которое гарантировано не 0
+	 */
+	start_word = 0;
+	if (bms->words[0] == 0)
+	{
+		for (int i = 1; i < bms->nwords; i++)
+		{
+			if (bms->words[i] != 0)
+			{
+				start_word = i;
+				break;
+			}
+		}
+	}
+
+	subsets = NIL;
+	while (true)
+	{
+		int next_word;
+	
+		/* 
+		 * Инициализируем первое слово: state = (-init) & init
+		 */
+		words[start_word] = (-bms->words[start_word]) & bms->words[start_word];
+
+		/* 
+		 * Итерируемся по нему до тех пор пока не получим 0 снова.
+		 * Учитываем, что первое слово также может всегда быть 0.
+		 */
+		while (words[start_word] != 0)
+		{
+			subsets = lappend(subsets, create_bms(words, bms->nwords));
+
+			words[start_word] = (words[start_word] - bms->words[start_word]) & bms->words[start_word];
+		}
+
+		/* 
+		 * Теперь, words[start_word] == 0, поэтому переходим к следующему слову.
+		 * При этом обрабатываем граничные случаи:
+		 *  - начальное слово и есть последнее
+		 *  - промежуточное слово может быть пустым
+		 */
+
+		if (start_word == (bms->nwords - 1))
+			break;
+
+		next_word = start_word + 1;
+	
+		while (next_word < bms->nwords)
+		{
+			while (next_word < bms->nwords && bms->words[next_word] == 0)
+				++next_word;
+			
+			if (bms->nwords <= next_word)	
+				break;
+
+			if (words[next_word] == 0)
+			{
+				/* Если слово 0, то инициализируем его и начинаем новый цикл */
+				words[next_word] = (-bms->words[next_word]) & bms->words[next_word];
+				break;
+			}
+
+			/* В противном случае, делаем итерацию */
+			words[next_word] = (words[next_word] - bms->words[next_word]) & bms->words[next_word];
+
+			/* 
+			 * В результате, у нас может получиться 0.
+			 * Это значит, что текущее слово еще не до конца перебрали - продолжаем.
+			 */
+			if (words[next_word] != 0)
+				break;
+
+			/* Если текущее слово закончилось, то переходим к следующему */
+			++next_word;
+		}
+
+		if (bms->nwords <= next_word)
+			break;
+
+		subsets = lappend(subsets, create_bms(words, bms->nwords));
+	}
+
+	pfree(words);
+	return subsets;
+}
+
 static List *generate_all_subsets(Bitmapset *bms)
 {
 	bitmapword state;
@@ -360,14 +494,14 @@ static List *generate_all_subsets(Bitmapset *bms)
 
 	/* 
 	 * Используем тот алгоритм с генерацией битовой маски и постоянного вычитания: (prev - init) & init
-	 * Пока ограничусь случаем с единственным словом.
-	 * TODO: реализовать длинную арифметику
 	 */
 	if (bms_is_empty(bms))
 		return NIL;
 	
-	if (bms->nwords != 1)
-		ereport(ERROR, errmsg("Only single word Bitmapset supported for now"));
+	if (1 < bms->nwords)
+		return generate_all_subsets_long(bms);
+
+	Assert(bms->nwords == 1);
 
 	init = bms->words[0];
 
@@ -375,13 +509,7 @@ static List *generate_all_subsets(Bitmapset *bms)
 	state = (-init) & init;
 	do
 	{
-		Bitmapset *subset;
-		subset = (Bitmapset *)palloc(offsetof(Bitmapset, words) + sizeof(bitmapword));
-		subset->type = T_Bitmapset;
-		subset->nwords = 1;
-		subset->words[0] = state;
-
-		result = lappend(result, subset);
+		result = lappend(result, create_bms(&state, 1));
 	} while ((state = (state - init) & init) != 0);
 
 	return result;
