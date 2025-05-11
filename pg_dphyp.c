@@ -294,14 +294,14 @@ static Bitmapset *get_neighbors(HyperNode *node, Bitmapset *excluded)
 			}
 			else
 			{
-				Bitmapset *filtered;
+				int representative;
 
-				filtered = bms_difference(set, excluded);
-				if (bms_is_empty(filtered))
+				if (bms_overlap(set, excluded))
 					continue;
-				
-				neighbors = bms_union(neighbors, filtered);
-				bms_free(filtered);
+			
+				Assert(!bms_is_empty(set));
+				representative = bms_first(set);
+				neighbors = bms_add_member(neighbors, representative);
 			}
 		}
 	}
