@@ -9,6 +9,11 @@
 #include "simplebms.h"
 
 /* 
+ * TODO: вместо RelOptInfo хранить - храню список HyperNode, которые собираюсь использовать для JOIN'а.
+ * В конце рекурсивно прохожусь по всем и вызываю make_join_rel - после этого set_cheapest и возвращаю результат.
+ */
+
+/* 
  * Represents a hypernode in query graph
  */
 typedef struct HyperNode
@@ -263,7 +268,7 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 
 	nodes = bmw_union(subgroup->nodes, complement->nodes);
 	hypernode = get_hypernode(context, nodes);
-
+	
 	joinrel = make_join_rel(context->root, subgroup->rel, complement->rel);
 	if (!joinrel)
 		return;
@@ -455,6 +460,8 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 	foreach(lc, rel->joininfo)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
+		ListCell *lc2;
+		bool can_add;
 		List *edge = NIL;
 
 		/* 
@@ -475,7 +482,11 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 			if (bmw_is_empty(right_bms))
 				continue;
 
-			edge = list_make2((void *)left_bms, (void *)right_bms);
+			/* Для удобства, сортируем bms - слева находится меньший */
+			if (left_bms < right_bms)
+				edge = list_make2((void *)left_bms, (void *)right_bms);
+			else
+				edge = list_make2((void *)right_bms, (void *)left_bms);
 		}
 		else
 		{
@@ -486,7 +497,50 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 				edge = list_make1((void *)bms);
 		}
 
-		if (edge)
+		if (!edge)
+			continue;
+
+		/* 
+		 * Проходимся по уже созданным узлам и проверяем, что новый узел не дублирует старые.
+		 * Нам не нужно смотреть внутрь выражения, так как ребро определяют вершины, которые входят в него.
+		 */
+		can_add = true;
+		foreach (lc2, edges)
+		{
+			List *existing_edge = (List *)lfirst(lc2);
+			if (list_length(existing_edge) != list_length(edge))
+				continue;
+			
+			if (list_length(existing_edge) == 1)
+			{
+				bitmapword existing_vertex = (bitmapword)linitial(existing_edge);
+				if (existing_vertex == (bitmapword)linitial(edge))
+				{
+					can_add = false;
+					break;
+				}
+			}
+			else
+			{
+				bitmapword left_existing = (bitmapword)linitial(existing_edge);
+				bitmapword right_existing = (bitmapword)llast(existing_edge);
+				bitmapword left_new = (bitmapword)linitial(edge);
+				bitmapword right_new = (bitmapword)llast(edge);
+				
+				Assert(list_length(existing_edge) == 2);
+
+				/* 
+				 * Достаточно такой проверки, так как вершины отсортированы.
+				 */
+				if (left_existing == left_new && right_existing == right_new)
+				{
+					can_add = false;
+					break;
+				}
+			}
+		}
+
+		if (can_add)
 			edges = lappend(edges, edge);
 	}
 
@@ -530,9 +584,15 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 	node->rel = rel;
 	node->representative = id;
 	node->nodes = bmw_make_singleton(id);
-	node->used_rels = NIL;
 
 	return node;
+}
+
+static int bmw_list_comparator(const ListCell *a, const ListCell *b)
+{
+	bitmapword a_nodes = (bitmapword)lfirst(a);
+	bitmapword b_nodes = (bitmapword)lfirst(b);
+	return a_nodes - b_nodes;
 }
 
 static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
@@ -575,6 +635,7 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 				List *new_edge = NIL;
 				bitmapword all_my_vertexes = 0;
 				bitmapword all_vertexes = 0;
+				bool can_add;
 
 				foreach(lc2, edge)
 				{
@@ -605,23 +666,100 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 				}
 
 				/* 
-				 * Добавляю новое гиперребро
+				 * Добавляю новое гиперребро.
+				 * Чтобы избавиться от дубликатов мы используем такой подход.
+				 * Все вершины ребра сортируются по возрастанию.
+				 * Когда приходит момент добавлять новое ребро, я прохожу по всем уже добавленным ребрам и проверяю, что нет ребра с таким же набором ребер.
+				 * Это сделать просто - проверяем размер ребра (кол-во вершин) а затем последовательно сравниваем все вершины - это можно сделать так как они отсортированы.
 				 */
-				if (new_edge != NIL)
-				{
-					/* 
-					 * Все вершины, полностью содержащиеся в новом гиперузле объединяю в одну вершину
-					 */
-					if (!bmw_is_empty(all_my_vertexes))
-						new_edge = lappend(new_edge, (void *) all_my_vertexes);
+				if (new_edge == NIL)
+					continue;
 
-					hyperedges = lappend(hyperedges, new_edge);
+				/* 
+				 * Все вершины, полностью содержащиеся в новом гиперузле объединяю в одну вершину
+				 */
+				if (!bmw_is_empty(all_my_vertexes))
+					new_edge = lappend(new_edge, (void *) all_my_vertexes);
+
+				/* 
+				 * Сортирую ребро по узлам, а потом проверяю дубликаты
+				 */
+				if (1 < list_length(new_edge))
+				{
+					/* Ради частного случая в 2 вершины не стоит запускать list_sort */
+					if (list_length(new_edge) == 2)
+					{
+						bitmapword first_vertex = (bitmapword)linitial(new_edge);
+						bitmapword second_vertex = (bitmapword)llast(new_edge);
+						if (second_vertex < first_vertex)
+						{
+							linitial(new_edge) = (void *) second_vertex;
+							llast(new_edge) = (void *) first_vertex;
+						}
+					}
+					else
+					{
+						list_sort(new_edge, bmw_list_comparator);
+					}
 				}
+
+				/* Проходим по всем ребрам и проверяем, что нет дубликатов */
+				can_add = true;
+				foreach(lc2, hyperedges)
+				{
+					List *other_edge = (List *)lfirst(lc2);
+					bool are_equal;
+
+					if (list_length(new_edge) != list_length(other_edge))
+						continue;
+
+					are_equal = true;
+					if (list_length(new_edge) == 1)
+					{
+						bitmapword v1 = (bitmapword)linitial(new_edge);
+						bitmapword v2 = (bitmapword)linitial(other_edge);
+						if (v1 != v2)
+							are_equal = false;
+					}
+					else if (list_length(new_edge) == 2)						
+					{
+						bitmapword first_vertex = (bitmapword)linitial(new_edge);
+						bitmapword second_vertex = (bitmapword)llast(new_edge);
+						bitmapword other_first_vertex = (bitmapword)linitial(other_edge);
+						bitmapword other_second_vertex = (bitmapword)llast(other_edge);
+						if (first_vertex != other_first_vertex || second_vertex != other_second_vertex)
+							are_equal = false;
+					}
+					else
+					{
+						ListCell *lc3;
+						ListCell *lc4;
+						forboth(lc3, new_edge, lc4, other_edge)
+						{
+							bitmapword first_vertex = (bitmapword)lfirst(lc3);
+							bitmapword second_vertex = (bitmapword)lfirst(lc4);
+							if (first_vertex != second_vertex)
+							{
+								are_equal = false;
+								break;
+							}
+						}
+
+					}
+
+					if (are_equal)
+					{
+						can_add = false;
+						break;
+					}
+				}
+
+				if (can_add)
+					hyperedges = lappend(hyperedges, new_edge);
 			}
 		}
 
 		node->hyperedges = hyperedges;
-		node->used_rels = NIL;
 	}
 
 	return node;
