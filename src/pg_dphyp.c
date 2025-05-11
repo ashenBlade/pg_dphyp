@@ -46,6 +46,7 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 	if (list_length(result) == 1)
 		return linitial(result);
 
+	elog(NOTICE, "running implicit join path");
 	if (prev_join_search_hook)
 		return prev_join_search_hook(root, list_length(result), result);
 	if (enable_geqo && list_length(result) >= geqo_threshold)

@@ -178,11 +178,24 @@ static bool hypernode_has_direct_edge_with(HyperNode *node, int id)
 		ListCell *lc2;
 		foreach (lc2, edge)
 		{
-			bitmapword bms = (bitmapword )lfirst(lc2);
+			bitmapword vertex = (bitmapword )lfirst(lc2);
 			
-			/* Каждый узел - это cross join set, поэтому просто проверим, что этот узел есть в хоть одном узле ребра */
-			if (bmw_is_member(bms, id))
-				return true;
+			/* 
+			 * Если узел - Cross Join Set со мной, то проверим, что нужный узел в нем есть
+			 */
+			if (bmw_is_subset(node->nodes, vertex))
+			{
+				if (bmw_is_member(vertex, id))
+					return true;
+			}
+			else
+			{
+				/* 
+				 * В противном случае, этот узел должен состоять только из этого элемента
+				 */
+				if (bmw_single_element(vertex, id))
+					return true;
+			}
 		}
 	}
 
@@ -201,8 +214,8 @@ static bool hypernode_has_edge_with(HyperNode *node, bitmapword bms)
 		ListCell *lc2;
 		foreach (lc2, edge)
 		{
-			bitmapword cjs = (bitmapword )lfirst(lc2);
-			if (bmw_is_subset(cjs, bms))
+			bitmapword vertex = (bitmapword )lfirst(lc2);
+			if (bmw_is_subset(bms, vertex))
 				return true;
 		}
 	}
@@ -256,6 +269,7 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 		return;
 
 	set_cheapest(joinrel);
+
 	/* Лениво инициализируем */
 	if (hypernode->rel == NULL)
         hypernode->rel = joinrel;
@@ -284,13 +298,8 @@ static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, Hype
 
 		if (superset_node->rel != NULL && 
 			hypernode_has_edge_with(node, neighbor_superset))
-		{
 			emit_csg_cmp(context, node, superset_node);
-		}
 	}
-	/* 
-	 * TODO: проследить где я создаю неправильный excluded
-	 */
 
 	/* 
 	 * X = X u N(S_2, X)
@@ -300,7 +309,7 @@ static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, Hype
 
 	complement_neighbors = get_neighbors(complement, excluded);
 	if (bmw_is_empty(complement_neighbors))
-	return;
+		return;
 	
 	neighbors_subsets = generate_all_subsets(complement_neighbors);
 
@@ -343,7 +352,11 @@ static void emit_csg(DPHypContext *context, HyperNode *node)
 		if (hypernode_has_direct_edge_with(node, i))
 			emit_csg_cmp(context, node, complement);
 
-		enumerate_cmp_recursive(context, node, complement, excluded);
+		/* 
+		 * Дополнительно надо учесть, что так как мы итерируемся в обратном порядке,
+		 * то надо добавить все в исключенные все отношения, нового базового отношения
+		 */
+		enumerate_cmp_recursive(context, node, complement, bmw_union(excluded, bmw_all_bit_set(i)));
 	}
 }
 
@@ -400,9 +413,10 @@ static void solve(DPHypContext *context)
 	for (int i = base_hypernodes_count - 1; i >= 0; i--)
 	{
 		HyperNode *node = (HyperNode *) list_nth(context->base_hypernodes, i);
-		CHECK_FOR_INTERRUPTS();
 		emit_csg(context, node);
 		enumerate_csg_recursive(context, node, bmw_all_bit_set(i));
+
+		CHECK_FOR_INTERRUPTS();
 	}
 }
 
@@ -516,6 +530,7 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 	node->rel = rel;
 	node->representative = id;
 	node->nodes = bmw_make_singleton(id);
+	node->used_rels = NIL;
 
 	return node;
 }
@@ -545,7 +560,7 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 		 * Если очередной узел этого ребра полностью находится в новом гиперузле,
 		 * то просто не добавляем этот узел в ребро.
 		 * 
-		 * TODO: надо еще проверять на дубликаты
+		 * TODO: надо еще проверять на дубликаты - может какую-нибудь логику добавлю по типу отслеживания ID отношений из ребра и добавлять только если мой ID больше (или типа того)
 		 */
 		id = -1;
 		while ((id = bmw_next_member(nodes, id)) >= 0)
@@ -558,20 +573,55 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 				List *edge = (List *)lfirst(lc);
 				ListCell *lc2;
 				List *new_edge = NIL;
+				bitmapword all_my_vertexes = 0;
+				bitmapword all_vertexes = 0;
 
 				foreach(lc2, edge)
 				{
-					bitmapword vertex = (bitmapword )lfirst(lc2);
-					if (!bmw_is_subset(vertex, nodes))
+					bitmapword vertex = (bitmapword)lfirst(lc2);
+
+					/* 
+					 * Отслеживаю все новые вершины в этом узле
+					 */
+					all_vertexes = bmw_union(all_vertexes, vertex);
+
+					/* 
+					 * Если все вершины ребра полностью находятся в новом гиперузле,
+					 * то их все добавляю в отдельную вершину
+					 */
+					if (bmw_is_subset(vertex, nodes))
+						all_my_vertexes = bmw_union(all_my_vertexes, vertex);
+					else
 						new_edge = lappend(new_edge, (void *) vertex);
 				}
 
+				/* 
+				 * Если ребро полностью в новом гиперузле, то ребро не добавляю
+				 */
+				if (bmw_is_subset(all_vertexes, nodes))
+				{
+					list_free(new_edge);
+					continue;
+				}
+
+				/* 
+				 * Добавляю новое гиперребро
+				 */
 				if (new_edge != NIL)
+				{
+					/* 
+					 * Все вершины, полностью содержащиеся в новом гиперузле объединяю в одну вершину
+					 */
+					if (!bmw_is_empty(all_my_vertexes))
+						new_edge = lappend(new_edge, (void *) all_my_vertexes);
+
 					hyperedges = lappend(hyperedges, new_edge);
+				}
 			}
 		}
 
 		node->hyperedges = hyperedges;
+		node->used_rels = NIL;
 	}
 
 	return node;

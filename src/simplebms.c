@@ -30,14 +30,20 @@ bitmapword bmw_union(bitmapword a, bitmapword b)
 	return a | b;
 }
 
+/* 
+ * Все элементы из a без элементов из b
+ */
 bitmapword bmw_difference(bitmapword a, bitmapword b)
 {
 	return a & ~b;
 }
 
+/* 
+ * a is subset of b
+ */
 bool bmw_is_subset(bitmapword a, bitmapword b)
 {
-	return (a & ~b) == 0;
+	return (a | b) == b;
 }
 
 bitmapword bmw_is_member(bitmapword bmw, int x)
@@ -118,4 +124,9 @@ int bmw_match(const void *key1, const void *key2, Size keysize)
 	Assert(keysize == sizeof(bitmapword));
 	
 	return *(const bitmapword *)key1 != *(const bitmapword *)key2;
+}
+
+bool bmw_single_element(bitmapword bmw, int x)
+{
+	return pg_popcount((const char *)&bmw, sizeof(bmw)) == 1 && bmw_is_member(bmw, x);
 }

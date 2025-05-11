@@ -20,6 +20,8 @@ static inline bool bmw_is_empty(bitmapword bmw)
 	return bmw == 0;
 }
 
+bool bmw_single_element(bitmapword bmw, int x);
+
 uint32 bmw_hash_value(bitmapword bmw);
 uint32 bmw_hash(const void *key, Size keysize);
 int bmw_match(const void *key1, const void *key2, Size keysize);

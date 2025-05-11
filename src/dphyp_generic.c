@@ -205,9 +205,22 @@ static bool hypernode_has_direct_edge_with(HyperNode *node, int id)
 		{
 			Bitmapset *bms = (Bitmapset *)lfirst(lc2);
 			
-			/* Каждый узел - это cross join set, поэтому просто проверим, что этот узел есть в хоть одном узле ребра */
-			if (bms_is_member(id, bms))
-				return true;
+			/* 
+			 * Если узел - Cross Join Set со мной, то проверим, что нужный узел в нем есть
+			 */
+			if (bms_is_subset(node->nodes, bms))
+			{
+				if (bms_is_member(id, bms))
+					return true;
+			}
+			else
+			{
+				/* 
+				 * В противном случае, этот узел должен состоять только из этого элемента
+				 */
+				if (bms_is_member(id, bms) && bms_membership(bms) == BMS_SINGLETON)
+					return true;
+			}
 		}
 	}
 
@@ -503,6 +516,7 @@ static void emit_csg(DPHypContext *context, HyperNode *node)
 	while ((i = bms_prev_member(neighbors, i)) >= 0)
 	{
 		HyperNode *complement;
+		Bitmapset *current_excluded;
 
 		/* 
 		 * В оригинальной статье здесь создается множество из единственного элемента.
@@ -514,7 +528,14 @@ static void emit_csg(DPHypContext *context, HyperNode *node)
 		if (hypernode_has_direct_edge_with(node, i))
 			emit_csg_cmp(context, node, complement);
 
-		enumerate_cmp_recursive(context, node, complement, excluded);
+		/* 
+		 * Так как мы итерируемся с конца, то не стоит забывать, что предыдущие
+		 * отношения не должны учитываться при поиске соседей.
+		 */
+		current_excluded = bms_union(excluded, create_all_bit_set(i));
+		enumerate_cmp_recursive(context, node, complement, current_excluded);
+
+		bms_free(current_excluded);
 	}
 }
 
@@ -735,16 +756,36 @@ static HyperNode *get_hypernode(DPHypContext *context, Bitmapset *nodes)
 				List *edge = (List *)lfirst(lc);
 				ListCell *lc2;
 				List *new_edge = NIL;
+				Bitmapset *all_my_vertexes = NULL;
+				Bitmapset *all_vertexes = NULL;
 
 				foreach(lc2, edge)
 				{
 					Bitmapset *vertex = (Bitmapset *)lfirst(lc2);
-					if (!bms_is_subset(vertex, nodes))
+
+					all_vertexes = bms_union(all_vertexes, vertex);
+
+					if (bms_is_subset(vertex, nodes))
+						all_my_vertexes = bms_union(all_my_vertexes, vertex);
+					else
 						new_edge = lappend(new_edge, vertex);
 				}
 
+				if (bms_is_subset(all_vertexes, nodes))
+				{
+					/* Если вообще все узлы ребра уже содержатся внутри меня, то оно нам не нужно */
+					bms_free(all_my_vertexes);
+					bms_free(all_vertexes);
+					list_free(new_edge);
+					continue;
+				}
+
 				if (new_edge != NIL)
+				{
+					if (!bms_is_empty(all_my_vertexes))
+						new_edge = lappend(new_edge, all_my_vertexes);
 					hyperedges = lappend(hyperedges, new_edge);
+				}
 			}
 		}
 
