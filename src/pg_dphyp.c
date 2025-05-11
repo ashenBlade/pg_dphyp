@@ -9,6 +9,8 @@
 #include "utils/guc.h"
 #include "miscadmin.h"
 
+#include "unionset.h"
+
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
 #endif
@@ -85,25 +87,6 @@ static inline int bms_first(Bitmapset *bms)
 	return res;
 }
 
-static int us_leader(int *leaders, int a)
-{
-	if (leaders[a] == a)
-		return a;
-	else
-		return leaders[a] = us_leader(leaders, leaders[a]);
-}
-
-static void us_union(int *leaders, int a, int b)
-{
-	int a_leader;
-	int b_leader;
-
-	a_leader = us_leader(leaders, a);
-	b_leader = us_leader(leaders, b);
-
-	leaders[a_leader] = b_leader;
-}
-
 static RelOptInfo *run_implicit_join_path(DPHypContext *context)
 {
 	/* 
@@ -112,19 +95,15 @@ static RelOptInfo *run_implicit_join_path(DPHypContext *context)
 	 * В таких случаях, мы используем UNION-SET структуру для нахождения всех
 	 * соединенных отношений (и получаем из RelOptInfo), а затем запускаем DPsize/GEQO для них.
 	 */
-	Bitmapset **disjoint_sets;
 	List *disjoint_relations;
+	List *disjoint_sets;
 	ListCell *lc;
-	int *leaders;
+	unionset_state us_state;
 	int num_leaders;
 
 	/* Инициализируем */
 	num_leaders = list_length(context->initial_rels);
-	leaders = palloc(sizeof(int) * num_leaders);
-	for (size_t i = 0; i < num_leaders; i++)
-	{
-		leaders[i] = i;
-	}
+	us_init(&us_state, num_leaders);
 	
 	/* Обхожу все гиперребра и составляю множества */
 	foreach(lc, context->base_hypernodes)
@@ -143,42 +122,30 @@ static RelOptInfo *run_implicit_join_path(DPHypContext *context)
 				while ((i = bms_next_member(vertex, i)) >= 0)
 				{
 					if (node->representative != i)
-						us_union(leaders, node->representative, i);
+						us_union(&us_state, node->representative, i);
 				}
 			}
 		}
 	}
 
-	/* Для каждого лидера создаем его Bitmapset */
-	disjoint_sets = palloc0(sizeof(Bitmapset *) * num_leaders);
-	for (size_t i = 0; i < num_leaders; i++)
-	{
-		int leader = us_leader(leaders, i);
-		if (disjoint_sets[leader] == NULL)
-		{
-			disjoint_sets[leader] = bms_make_singleton(i);
-		}
-		else
-		{
-			disjoint_sets[leader] = bms_add_member(disjoint_sets[leader], i);
-		}
-	}
+	/* Собираем все непересекающиеся множества */
+	disjoint_sets = us_collect(&us_state);
 	
 	/* Заново проходимся и собираем все RelOptInfo */
 	disjoint_relations = NIL;
-	for (size_t i = 0; i < num_leaders; i++)
+	foreach(lc, disjoint_sets)
 	{
 		HyperNode *hypernode;
-
-		if (disjoint_sets[i] == NULL)
-			continue;
-		
-		hypernode = get_hypernode(context, disjoint_sets[i]);
+		Bitmapset *disjoint_set = (Bitmapset *)lfirst(lc);
+		hypernode = get_hypernode(context, disjoint_set);
 		if (hypernode->rel == NULL)
 			elog(ERROR, "failed to create RelOptInfo for disjoint set");
 		
 		disjoint_relations = lappend(disjoint_relations, hypernode->rel);
+		bms_free(disjoint_set);
 	}
+
+	list_free(disjoint_sets);
 	
 	/* Запускаем обычный алгоритм JOIN для непересекающихся множеств */
 	if (prev_join_search_hook)
