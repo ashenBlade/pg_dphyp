@@ -400,7 +400,7 @@ static void enumerate_csg_recursive(DPHypContext *context, HyperNode *node, bitm
 	foreach (lc, subsets)
 	{
 		bitmapword neighbor_set = (bitmapword )lfirst(lc);
-		bitmapword subset = bmw_difference(node->nodes, neighbor_set);
+		bitmapword subset = bmw_union(node->nodes, neighbor_set);
 		HyperNode *subnode;
 
 		subnode = get_hypernode(context, subset);
