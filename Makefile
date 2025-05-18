@@ -4,9 +4,7 @@ MODULE_big = pg_dphyp
 OBJS = $(WIN32RES) \
 	src/pg_dphyp.o \
 	src/unionset.o \
-	src/dphyp_generic.o \
-	src/dphyp_simple.o \
-	src/simplebms.o
+	src/dphyp.o
 
 PG_CPPFLAGS += -Isrc/include
 
