@@ -295,10 +295,11 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 	joinrel = make_join_rel(context->root, subgroup->rel, complement->rel);
 	if (!joinrel)
 		return;
-
+		
 	/*
 	 * Find best path for this rel or update existing one.
 	 */
+	generate_partitionwise_join_paths(context->root, joinrel);
 	set_cheapest(joinrel);
 
 	if (hypernode->rel == NULL)
