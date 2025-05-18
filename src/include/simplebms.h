@@ -103,6 +103,9 @@ bmw_prev_member(bitmapword bmw, int prevbit)
 {
 	bitmapword mask;
 
+	if (prevbit == 0)
+		return -1;
+
 	if (prevbit == -1)
 	{
 		prevbit = BITS_PER_BITMAPWORD - 1;

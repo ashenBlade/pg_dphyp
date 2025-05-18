@@ -117,7 +117,6 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 void
 _PG_init(void)
 {
-
 	DefineCustomBoolVariable("pg_dphyp.enabled",
 							 "pg_dphyp join enumeration algorithm is enabled",
 							 NULL,

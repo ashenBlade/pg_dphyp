@@ -245,25 +245,26 @@ static bool hypernode_has_edge_with(HyperNode *node, bitmapword bms)
 	return false;
 }
 
-/* TODO: iterator state instead of generating all possible permutations in List */
-static List *generate_all_subsets(bitmapword bms)
+typedef struct
 {
 	bitmapword state;
 	bitmapword init;
-	List *result = NIL;
+} SubsetIteratorState;
 
-	if (bmw_is_empty(bms))
-		return NIL;
+static void subset_iterator_init(SubsetIteratorState *state, bitmapword bmw)
+{
+	state->init = bmw;
+	state->state = (-bmw) & bmw;
+}
 
-	init = bms;
-
-	state = (-init) & init;
-	do
-	{
-		result = lappend(result, (void *) state);
-	} while ((state = (state - init) & init) != 0);
-
-	return result;
+static bool subset_iterator_next(SubsetIteratorState *state, bitmapword *result)
+{
+	if (state->state == 0)
+		return false;
+	
+	*result = state->state;
+	state->state = (state->state - state->init) & state->init;
+	return true;
 }
 
 static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *complement)
@@ -308,18 +309,16 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, HyperNode *complement, bitmapword excluded)
 {
 	bitmapword complement_neighbors;
-
-	List *neighbors_subsets;
-	ListCell *lc;
+	SubsetIteratorState subset_iter;
+	bitmapword subset;
 
 	complement_neighbors = get_neighbors(complement, excluded);
 	if (bmw_is_empty(complement_neighbors))
 		return;
 
-	neighbors_subsets = generate_all_subsets(complement_neighbors);
-	foreach(lc, neighbors_subsets)
+	subset_iterator_init(&subset_iter, complement_neighbors);
+	while (subset_iterator_next(&subset_iter, &subset))
 	{
-		bitmapword subset = (bitmapword )lfirst(lc);
 		bitmapword neighbor_superset;
 		HyperNode *superset_node;
 
@@ -332,17 +331,14 @@ static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, Hype
 	}
 
 	excluded = bmw_union(excluded, complement_neighbors);
-	list_free(neighbors_subsets);
 
 	complement_neighbors = get_neighbors(complement, excluded);
 	if (bmw_is_empty(complement_neighbors))
 		return;
 	
-	neighbors_subsets = generate_all_subsets(complement_neighbors);
-
-	foreach(lc, neighbors_subsets)
+	subset_iterator_init(&subset_iter, complement_neighbors);
+	while (subset_iterator_next(&subset_iter, &subset))
 	{
-		bitmapword subset = (bitmapword)lfirst(lc);
 		bitmapword neighbor_superset;
 		HyperNode *superset_node;
 
@@ -389,43 +385,37 @@ static void emit_csg(DPHypContext *context, HyperNode *node)
 
 static void enumerate_csg_recursive(DPHypContext *context, HyperNode *node, bitmapword excluded)
 {
+	SubsetIteratorState subset_iter;
+	bitmapword subset;
 	bitmapword neighbors;
-	List *subsets;
 	bitmapword excluded_ext;
-	ListCell *lc;
 
 	neighbors = get_neighbors(node, excluded);
 	if (bmw_is_empty(neighbors))
 		return;
 
-	subsets = generate_all_subsets(neighbors);
-	if (subsets == NIL)
-		return;
-
-	foreach(lc, subsets)
+	subset_iterator_init(&subset_iter, neighbors);
+	while (subset_iterator_next(&subset_iter, &subset))
 	{
-		bitmapword neighbor_set = (bitmapword )lfirst(lc);
-		bitmapword subset = bmw_union(node->nodes, neighbor_set);
+		bitmapword superset = bmw_union(node->nodes, subset);
 		HyperNode *subnode;
 		
-		subnode = get_hypernode(context, subset);
+		subnode = get_hypernode(context, superset);
 		if (subnode->rel != NULL)
 			emit_csg(context, subnode);
 	}
 
 	excluded_ext = bmw_union(excluded, neighbors);
 
-	foreach (lc, subsets)
+	subset_iterator_init(&subset_iter, neighbors);
+	while (subset_iterator_next(&subset_iter, &subset))
 	{
-		bitmapword neighbor_set = (bitmapword )lfirst(lc);
-		bitmapword subset = bmw_union(node->nodes, neighbor_set);
+		bitmapword superset = bmw_union(node->nodes, subset);
 		HyperNode *subnode;
 
-		subnode = get_hypernode(context, subset);
+		subnode = get_hypernode(context, superset);
 		enumerate_csg_recursive(context, subnode, excluded_ext);
 	}
-
-	list_free(subsets);
 }
 
 static void solve(DPHypContext *context)
@@ -585,7 +575,7 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 			List *edge;
 
 			/* Process only EC containing possible JOIN clauses */
-			Assert(!bms_equal(ec->ec_relids, rel->relids));
+			if (bms_equal(ec->ec_relids, rel->relids))
 				continue;
 
 			edge = NIL;
