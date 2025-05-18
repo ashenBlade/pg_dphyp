@@ -8,30 +8,30 @@
 #include "unionset.h"
 #include "simplebms.h"
 
-/* 
+/*
  * Represents a hypernode in query graph
  */
 typedef struct HyperNode
 {
-	/* 
+	/*
 	 * Bitmap of relations this Hypernode represents.
 	 * Must be first field in structure - used as key.
 	 */
 	bitmapword nodes;
 
-	/* 
+	/*
 	 * Cached representative node of this Hypernode as used in original paper.
 	 */
 	int representative;
 
-	/* 
+	/*
 	 * Created 'RelOptInfo' for this HyperNode.
 	 * May be NULL in cases it is created on demand and used transiently (to pass
 	 * as argument)
 	 */
 	RelOptInfo *rel;
 
-	/* 
+	/*
 	 * List of hyperedges, that this node belongs to.
 	 * Each hypernode is represented as List of nodes and each node is bitmapword - Cross Join Set.
 	 * Also, each hyperedge not only contains 2 nodes, but any count.
@@ -39,27 +39,27 @@ typedef struct HyperNode
 	List *hyperedges;
 } HyperNode;
 
-/* 
+/*
  * Context object, that passed along with any function invocation.
  */
 typedef struct DPHypContext
 {
-	/* 
+	/*
 	 * Original planner info
 	 */
 	PlannerInfo *root;
 
-	/* 
+	/*
 	 * List of initial passed 'RelOptInfo' objects.
 	 */
 	List *initial_rels;
 
-	/* 
+	/*
 	 * List of Hypernodes created for initial relations.
 	 */
 	List *base_hypernodes;
 
-	/* 
+	/*
 	 * Dynamic programming table that maps: bitmapword -> HyperNode.
 	 */
 	HTAB *dptable;
@@ -73,13 +73,13 @@ static HTAB *create_dptable(List *base_hypernodes)
 	HTAB *dptable;
 	HASHCTL hctl;
 
-	/* TODO: calculate optimal initial size of hash table */
+	/* Initial size of HTAB given from 'build_join_rel_hash' */
 	hctl.keysize = sizeof(bitmapword);
 	hctl.entrysize = sizeof(HyperNode);
 	hctl.hash = bmw_hash;
 	hctl.match = bmw_match;
 	hctl.hcxt = CurrentMemoryContext;
-	dptable = (HTAB *)hash_create("DPHyp Hash Table", 1024L, &hctl,
+	dptable = (HTAB *)hash_create("DPhypHyperNodeHashTable", 256L, &hctl,
 								  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
 
 	foreach (lc, base_hypernodes)
@@ -106,7 +106,7 @@ static HTAB *create_dptable(List *base_hypernodes)
  */
 static bitmapword get_neighbors(HyperNode *node, bitmapword excluded)
 {
-	/* 
+	/*
 	 * Neighbors of hypernode are just all reachable nodes from this node
 	 * except excluded.
 	 * In such setting, all we need to do is to iterate through all edges
@@ -120,20 +120,19 @@ static bitmapword get_neighbors(HyperNode *node, bitmapword excluded)
 	{
 		List *edge = (List *)lfirst(lc);
 		ListCell *lc2;
-		
-		/* Проходимся по каждому узлу в гиперребре */
+
 		foreach (lc2, edge)
 		{
 			bitmapword set = (bitmapword )lfirst(lc2);
 
-			/* 
+			/*
 			 * With concept of Cross Join Sets logic changes a bit - we must
 			 * separately handle CJS that contains current node from those that don't.
-			 * 
+			 *
 			 * If current edge node contains us, then we implicitly join ourself
 			 * with every node in that node - treat as multiple CROSS JOIN edges.
 			 * So calculate difference '(edge_node / node) / excluded' and add all to our neighbors.
-			 * 
+			 *
 			 * Otherwise, treat as plain usual edge just like in paper - check
 			 * it does not contain any excluded nodes and add only representative.
 			 */
@@ -162,18 +161,18 @@ static bitmapword get_neighbors(HyperNode *node, bitmapword excluded)
 				/* Proceed as in original paper - check no excluded and add representative */
 				if (bmw_overlap(set, excluded))
 					continue;
-			
+
 				Assert(!bmw_is_empty(set));
 				representative = bmw_first(set);
 				neighbors = bmw_add_member(neighbors, representative);
 			}
 		}
 	}
-	
+
 	return neighbors;
 }
 
-/* 
+/*
  * Check that 'node' has direct edge with node 'id'.
  * This is not the same as 'has_edge_with' because we must check
  * that it has *direct* edge.
@@ -193,10 +192,10 @@ static bool hypernode_has_direct_edge_with(HyperNode *node, int id)
 		foreach (lc2, edge)
 		{
 			bitmapword vertex = (bitmapword )lfirst(lc2);
-			
+
 			if (bmw_is_subset(node->nodes, vertex))
 			{
-				/* 
+				/*
 				 * For CJS with us - check 'id' is member of edge
 				 */
 				if (bmw_is_member(vertex, id))
@@ -204,7 +203,7 @@ static bool hypernode_has_direct_edge_with(HyperNode *node, int id)
 			}
 			else
 			{
-				/* 
+				/*
 				 * For usual edges - check this is single element
 				 */
 				if (bmw_equal(vertex, bmw))
@@ -216,7 +215,7 @@ static bool hypernode_has_direct_edge_with(HyperNode *node, int id)
 	return false;
 }
 
-/* 
+/*
  * Check that 'node' has any edge that can be used as connection to 'bms'
  */
 static bool hypernode_has_edge_with(HyperNode *node, bitmapword bms)
@@ -233,7 +232,7 @@ static bool hypernode_has_edge_with(HyperNode *node, bitmapword bms)
 		{
 			bitmapword vertex = (bitmapword )lfirst(lc2);
 
-			/* 
+			/*
 			 * Of course, we may have vertex intersecting with node,
 			 * but logic is the same for both cases - check subset.
 			 */
@@ -261,7 +260,7 @@ static bool subset_iterator_next(SubsetIteratorState *state, bitmapword *result)
 {
 	if (state->state == 0)
 		return false;
-	
+
 	*result = state->state;
 	state->state = (state->state - state->init) & state->init;
 	return true;
@@ -273,7 +272,7 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 	RelOptInfo *joinrel;
 	HyperNode *hypernode;
 
-	/* 
+	/*
 	 * For this moment, RelOptInfo for both subgroup and complement must exist
 	 */
 	Assert(subgroup->rel);
@@ -281,12 +280,12 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 
 	nodes = bmw_union(subgroup->nodes, complement->nodes);
 	hypernode = get_hypernode(context, nodes);
-	
+
 	/*
 	 * Our DPhyp logic reuse code from original postgres' DPsize algorithm.
 	 * And main function - is 'make_join_rel' which actually creates 'RelOptInfo'
 	 * and find all possible paths.
-	 * 
+	 *
 	 * Current implementation works well with INNER JOIN, but in case of
 	 * outer joins (LEFT/SEMI/ANTI/OUTER etc...) it can misbehave due to
 	 * join ordering restrictions imposed by outer joints.
@@ -297,7 +296,7 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 	if (!joinrel)
 		return;
 
-	/* 
+	/*
 	 * Find best path for this rel or update existing one.
 	 */
 	set_cheapest(joinrel);
@@ -325,7 +324,7 @@ static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, Hype
 		neighbor_superset = bmw_union(complement->nodes, subset);
 		superset_node = get_hypernode(context, neighbor_superset);
 
-		if (superset_node->rel != NULL && 
+		if (superset_node->rel != NULL &&
 			hypernode_has_edge_with(node, neighbor_superset))
 			emit_csg_cmp(context, node, superset_node);
 	}
@@ -335,7 +334,7 @@ static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, Hype
 	complement_neighbors = get_neighbors(complement, excluded);
 	if (bmw_is_empty(complement_neighbors))
 		return;
-	
+
 	subset_iterator_init(&subset_iter, complement_neighbors);
 	while (subset_iterator_next(&subset_iter, &subset))
 	{
@@ -365,7 +364,7 @@ static void emit_csg(DPHypContext *context, HyperNode *node)
 	{
 		HyperNode *complement;
 
-		/* 
+		/*
 		 * Here in original paper we create set with single element.
 		 * Then during edges iteration we find edge right node of which is 'subset' of set created above.
 		 * But the only possible option - right node is the same set, because subset of single set - it is same same set.
@@ -375,7 +374,7 @@ static void emit_csg(DPHypContext *context, HyperNode *node)
 		if (hypernode_has_direct_edge_with(node, i))
 			emit_csg_cmp(context, node, complement);
 
-		/* 
+		/*
 		 * We are iterating backwards, so we have to excluded all neighbors that are going to be visited.
 		 * Otherwise, we will get duplicates and execution time will skyrocket.
 		 */
@@ -399,7 +398,7 @@ static void enumerate_csg_recursive(DPHypContext *context, HyperNode *node, bitm
 	{
 		bitmapword superset = bmw_union(node->nodes, subset);
 		HyperNode *subnode;
-		
+
 		subnode = get_hypernode(context, superset);
 		if (subnode->rel != NULL)
 			emit_csg(context, subnode);
@@ -429,7 +428,7 @@ static void solve(DPHypContext *context)
 		emit_csg(context, node);
 		enumerate_csg_recursive(context, node, bmw_all_bit_set(i));
 
-		/* 
+		/*
 		 * When amount of relation is high, execution time will grow exponentially and user may request cancellation.
 		 * This seems a good place to check this.
 		 */
@@ -437,7 +436,7 @@ static void solve(DPHypContext *context)
 	}
 }
 
-/* 
+/*
  * Map Relids specified in 'original' to internal presentation based on id of relation
  */
 static bitmapword map_to_internal_bms(List *initial_rels, Bitmapset *original)
@@ -458,7 +457,7 @@ static bitmapword map_to_internal_bms(List *initial_rels, Bitmapset *original)
 
 		++id;
 	}
-	
+
 	return target;
 }
 
@@ -479,7 +478,7 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 		bool can_add;
 		List *edge = NIL;
 
-		/* 
+		/*
 		 * Such check for binary operator is presented in 'make_restrictinfo_internal'
 		 */
 		if (!bms_is_empty(rinfo->left_relids) &&
@@ -515,7 +514,7 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 		if (!edge)
 			continue;
 
-		/* 
+		/*
 		 * Verify, that there are no duplicates of edges we are going to add.
 		 * This can be true in cases when there are multiple join clauses on same set of relations.
 		 * For algorithm purposes, we only need to have one copy of such edge.
@@ -526,7 +525,7 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 			List *existing_edge = (List *)lfirst(lc2);
 			if (list_length(existing_edge) != list_length(edge))
 				continue;
-			
+
 			if (list_length(existing_edge) == 1)
 			{
 				bitmapword existing_vertex = (bitmapword)linitial(existing_edge);
@@ -542,10 +541,10 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 				bitmapword right_existing = (bitmapword)llast(existing_edge);
 				bitmapword left_new = (bitmapword)linitial(edge);
 				bitmapword right_new = (bitmapword)llast(edge);
-				
+
 				Assert(list_length(existing_edge) == 2);
 
-				/* 
+				/*
 				 * Vertices are sorted, so there is only single check is required.
 				 */
 				if (left_existing == left_new && right_existing == right_new)
@@ -560,7 +559,7 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 			edges = lappend(edges, edge);
 	}
 
-	/* 
+	/*
 	 * PostgreSQL has equivalence classes mechanism that also used for join clauses.
 	 * For such cases we can not create conventional edges (1 or 2 vertices) - amount of them will grow exponentially.
 	 * So, we extend our hyperedges that way it can contain any amount of vertices.
@@ -586,7 +585,7 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 
 				if (em->em_is_const)
 					continue;
-				
+
 				Assert(!bms_is_empty(em->em_relids));
 				bmw = map_to_internal_bms(initial_rels, em->em_relids);
 				if (!bmw_is_empty(bmw))
@@ -618,7 +617,7 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 	HyperNode *node;
 	bitmapword key = nodes;
 	bool found;
-	
+
 	node = hash_search(context->dptable, &key, HASH_ENTER, &found);
 
 	if (!found)
@@ -632,16 +631,16 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 
 		hyperedges = NIL;
 
-		/* 
+		/*
 		 * If this hypernode created for the first time, we must initialize it's hyperedges.
 		 * This is done by merging all hyperedges from base hypernodes it contains.
 		 * When iterating over hyperedges we skip all hypernodes that fully enclosed in current hypernode.
-		 * 
+		 *
 		 * There are some optimizations for merging base hyperedges.
-		 * 
+		 *
 		 * 1. We also try to eliminate all duplicates, otherwise the same edge will be created for every base hypernode it mentions.
 		 * This is done by sorting all hypernodes in hyperedges and then comparing newly created edge with all added ones.
-		 * 
+		 *
 		 * 2. All different vertexes fully enclosed in newly created hypernode will be merged into single vertex.
 		 * This helps us to reduce vertexes count and thus improve performance.
 		 * Note, that this is helpful primarily for EC hyperedges.
@@ -673,7 +672,7 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 						new_edge = lappend(new_edge, (void *) vertex);
 				}
 
-				/* 
+				/*
 				 * Skip edge that fully enclosed in current hypernode.
 				 * It is not useful for further processing, because no neighbors will be detected from it.
 				 */
@@ -686,13 +685,13 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 				if (new_edge == NIL)
 					continue;
 
-				/* 
+				/*
 				 * Merge all vertexes that belongs to new hypernode into single vertex.
 				 */
 				if (!bmw_is_empty(all_my_vertexes))
 					new_edge = lappend(new_edge, (void *) all_my_vertexes);
 
-				/* 
+				/*
 				 * Sort vertexes to further detect duplicates.
 				 */
 				if (1 < list_length(new_edge))
@@ -733,7 +732,7 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 						if (v1 != v2)
 							are_equal = false;
 					}
-					else if (list_length(new_edge) == 2)						
+					else if (list_length(new_edge) == 2)
 					{
 						bitmapword first_vertex = (bitmapword)linitial(new_edge);
 						bitmapword second_vertex = (bitmapword)llast(new_edge);
@@ -783,7 +782,7 @@ static List *collect_disjoint_relations(DPHypContext *context)
 	/*
 	 * When we encounter implicit 'CROSS JOIN's, then our hypergraph will not contain edges between these subgraphs, thus producing disjoint sets of graphs.
 	 * DPsize solves this problem just by creating each possible join of relations, but DPhyp will not detect this.
-	 * 
+	 *
 	 * If there is no 'RelOptInfo' created for top level hypernode, it means we have implicit 'CROSS JOIN's and have to handle it.
 	 * We solve this collecting already solved problems (subgraphs) and running DPsize/GEQO with new 'RelOptInfo' set.
 	 * To collect all disjoint sets we use UNION-SET structure with ID of hypernode as key for sets.
@@ -796,7 +795,7 @@ static List *collect_disjoint_relations(DPHypContext *context)
 
 	num_leaders = list_length(context->initial_rels);
 	us_init(&us_state, num_leaders);
-	
+
 	/* Generate sets */
 	foreach(lc, context->base_hypernodes)
 	{
@@ -823,16 +822,16 @@ static List *collect_disjoint_relations(DPHypContext *context)
 	/* Collect all disjoint sets */
 	disjoint_sets = us_collect(&us_state);
 
-	/* 
+	/*
 	 * Currently, we can not handle some queries with complex query-tree structures.
 	 * i.e. with lots of LEFT/RIGHT/OUTER JOIN's
-	 * 
+	 *
 	 * For these cases, we return NIL as a signal to run DPsize/GEQO (fallback)
 	 */
 	Assert(disjoint_sets != NIL);
 	if (list_length(disjoint_sets) == 1)
 		return NIL;
-	
+
 	/* Iterate through all disjoint sets and collect 'RelOptInfo' for them */
 	disjoint_relations = NIL;
 	foreach(lc, disjoint_sets)
@@ -847,7 +846,7 @@ static List *collect_disjoint_relations(DPHypContext *context)
 		{
 			simple_disjoint_set = bmw_add_member(simple_disjoint_set, i);
 		}
-		
+
 		hypernode = get_hypernode(context, simple_disjoint_set);
 		if (hypernode->rel == NULL)
 		{
@@ -891,7 +890,7 @@ List *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
 
 	dptable = create_dptable(base_hypernodes);
 
-	/* 
+	/*
 	 * Access paths for all rels in 'initial_rels' already found.
 	 * Ready to run DPHyp.
 	 */
