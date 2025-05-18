@@ -9,9 +9,7 @@
 #include "utils/guc.h"
 #include "miscadmin.h"
 
-#include "unionset.h"
-#include "dphyp_generic.h"
-#include "dphyp_simple.h"
+#include "dphyp.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -19,6 +17,8 @@ PG_MODULE_MAGIC;
 
 static join_search_hook_type prev_join_search_hook = NULL;
 
+/* GUC */
+/* Extension is enabled and should run DPhyp */
 static bool enabled = true;
 
 void _PG_init(void);
@@ -28,7 +28,7 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 {
 	List *result;
 
-	if (!enabled)
+	if (!enabled || levels_needed <= BITS_PER_BITMAPWORD)
 	{
 		if (prev_join_search_hook)
 			return prev_join_search_hook(root, levels_needed, initial_rels);
@@ -37,16 +37,31 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 		return standard_join_search(root, levels_needed, initial_rels);
 	}
 
-	if (BITS_PER_BITMAPWORD < levels_needed)
-		result = dphyp_generic(root, levels_needed, initial_rels);
-	else
-		result = dphyp_simple(root, levels_needed, initial_rels);
+	result = dphyp(root, levels_needed, initial_rels);
 
-	Assert(result != NIL);
+	/* Successfully found join order */
 	if (list_length(result) == 1)
-		return linitial(result);
+	{
+		RelOptInfo *rel = linitial(result);
+		list_free(result);
+		return rel;
+	}
 
-	elog(NOTICE, "running implicit join path");
+	/* 
+	 * Single relation in List means we successfully found query plan.
+	 * But we may fail and in this case we can have:
+	 * 
+	 * 1. NIL
+	 * 2. Any amount of relations
+	 * 
+	 * First case means we can not do anything, so pass 'initial_rels' to conventional DPsize/GEQO.
+	 * The second case means we have implicit joins, but plans for disjoint sets are found - pass what we have found to DPsize/GEQO.
+	 */
+	if (result == NIL)
+	{
+		result = initial_rels;
+	}
+
 	if (prev_join_search_hook)
 		return prev_join_search_hook(root, list_length(result), result);
 	if (enable_geqo && list_length(result) >= geqo_threshold)

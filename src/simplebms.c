@@ -46,6 +46,11 @@ bool bmw_is_subset(bitmapword a, bitmapword b)
 	return (a | b) == b;
 }
 
+bool bmw_equal(bitmapword a, bitmapword b)
+{
+	return a == b;
+}
+
 bitmapword bmw_is_member(bitmapword bmw, int x)
 {
 	ValidateBmwMember(x);

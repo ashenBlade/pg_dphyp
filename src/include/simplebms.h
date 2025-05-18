@@ -13,6 +13,7 @@ bitmapword bmw_difference(bitmapword a, bitmapword b);
 bitmapword bmw_is_member(bitmapword a, int x);
 bitmapword bmw_overlap(bitmapword a, bitmapword b);
 bool bmw_is_subset(bitmapword a, bitmapword b);
+bool bmw_equal(bitmapword a, bitmapword b);
 int bmw_first(bitmapword a);
 
 static inline bool bmw_is_empty(bitmapword bmw)
