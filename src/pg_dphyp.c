@@ -19,16 +19,61 @@ static join_search_hook_type prev_join_search_hook = NULL;
 
 /* GUC */
 /* Extension is enabled and should run DPhyp */
-static bool enabled = true;
+static bool dphyp_enabled = true;
+/* Do not apply DPhyp if SJ found (LEFT/RIGHT/OUTER etc...) */
+static bool dphyp_skip_sj = true;
 
 void _PG_init(void);
 void _PG_fini(void);
+
+static bool contains_sj(PlannerInfo *root, List *initial_rels)
+{
+	ListCell *lc;
+	List *join_rels;
+	Bitmapset *all_relids;
+
+	if (root->join_info_list == NIL)
+		return false;
+
+	all_relids = NULL;
+	join_rels = NIL;
+	foreach(lc, initial_rels)
+	{
+		RelOptInfo *rel = (RelOptInfo *) lfirst(lc);
+		all_relids = bms_add_members(all_relids, rel->relids);
+		if (IS_JOIN_REL(rel))
+		{
+			join_rels = lappend(join_rels, rel);
+		}
+	}
+
+	/* Find first SJ that we participate in */
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+
+		if (sjinfo->jointype == JOIN_INNER)
+			continue;
+
+		if (!(bms_overlap(all_relids, sjinfo->min_lefthand) ||
+			  bms_overlap(all_relids, sjinfo->min_righthand)))
+			continue;
+
+		bms_free(all_relids);
+		return true;
+	}
+
+	bms_free(all_relids);
+	return false;
+}
 
 static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
 	List *result;
 
-	if (!enabled || levels_needed <= BITS_PER_BITMAPWORD)
+	if (!dphyp_enabled ||
+		BITS_PER_BITMAPWORD <= levels_needed ||
+		(dphyp_skip_sj && contains_sj(root, initial_rels)))
 	{
 		if (prev_join_search_hook)
 			return prev_join_search_hook(root, levels_needed, initial_rels);
@@ -63,10 +108,10 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 	}
 
 	if (prev_join_search_hook)
-		return prev_join_search_hook(root, list_length(result), result);
-	if (enable_geqo && list_length(result) >= geqo_threshold)
-		return geqo(root, list_length(result), result);
-	return standard_join_search(root, list_length(result), result);
+		return prev_join_search_hook(root, levels_needed, result);
+	if (enable_geqo && levels_needed >= geqo_threshold)
+		return geqo(root, levels_needed, result);
+	return standard_join_search(root, levels_needed, result);
 }
 
 void
@@ -76,8 +121,15 @@ _PG_init(void)
 	DefineCustomBoolVariable("pg_dphyp.enabled",
 							 "pg_dphyp join enumeration algorithm is enabled",
 							 NULL,
-							 &enabled,
-							 enabled,
+							 &dphyp_enabled,
+							 dphyp_enabled,
+							 PGC_USERSET,
+							 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_dphyp.skip_sj",
+							 "Do not run DPhyp if any special join detected",
+							 NULL,
+							 &dphyp_skip_sj,
+							 dphyp_skip_sj,
 							 PGC_USERSET,
 							 0, NULL, NULL, NULL);
 	MarkGUCPrefixReserved("pg_dphyp");
