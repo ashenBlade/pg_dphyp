@@ -63,6 +63,9 @@ typedef struct DPHypContext
 	 * Dynamic programming table that maps: bitmapword -> HyperNode.
 	 */
 	HTAB *dptable;
+
+
+	bitmapword all_query_nodes;
 } DPHypContext;
 
 static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes);
@@ -298,8 +301,11 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 		
 	/*
 	 * Find best path for this rel or update existing one.
+	 * Code copied from 'standard_join_search'.
 	 */
 	generate_partitionwise_join_paths(context->root, joinrel);
+    if (!bmw_equal(context->all_query_nodes, hypernode->nodes))
+		generate_useful_gather_paths(context->root, joinrel, false);
 	set_cheapest(joinrel);
 
 	if (hypernode->rel == NULL)
@@ -870,7 +876,6 @@ List *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
 	HTAB *dptable;
 	HyperNode *result;
-	bitmapword all_rels_bit_set;
 	DPHypContext context;
 	List *base_hypernodes;
 	ListCell *lc;
@@ -899,10 +904,10 @@ List *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
 	context.initial_rels = initial_rels;
 	context.root = root;
 	context.base_hypernodes = base_hypernodes;
+	context.all_query_nodes = bmw_all_bit_set(list_length(initial_rels) - 1);
 	solve(&context);
-
-	all_rels_bit_set = bmw_all_bit_set(list_length(initial_rels) - 1);
-	result = hash_search(dptable, &(all_rels_bit_set), HASH_FIND, &result_found);
+	
+	result = hash_search(dptable, &context.all_query_nodes, HASH_FIND, &result_found);
 	if (result && result->rel)
 		return list_make1(result->rel);
 
