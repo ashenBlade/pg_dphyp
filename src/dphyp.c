@@ -911,6 +911,10 @@ List *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
 	if (result && result->rel)
 		return list_make1(result->rel);
 
+	/* SJ are not handled by this DPhyp correctly */
+	if (root->join_info_list)
+		return NIL;
+	
 	/* If we failed to create plan for whole relation, maybe there are implicit joins */
 	return collect_disjoint_relations(&context);
 }

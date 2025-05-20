@@ -29,54 +29,24 @@ static int dphyp_geqo_threshold = 12;
 void _PG_init(void);
 void _PG_fini(void);
 
-static bool contains_sj(PlannerInfo *root, List *initial_rels)
+static inline bool contains_sj(PlannerInfo *root)
 {
-	ListCell *lc;
-	List *join_rels;
-	Bitmapset *all_relids;
-
-	if (root->join_info_list == NIL)
-		return false;
-
-	all_relids = NULL;
-	join_rels = NIL;
-	foreach(lc, initial_rels)
-	{
-		RelOptInfo *rel = (RelOptInfo *) lfirst(lc);
-		all_relids = bms_add_members(all_relids, rel->relids);
-		if (IS_JOIN_REL(rel))
-		{
-			join_rels = lappend(join_rels, rel);
-		}
-	}
-
-	/* Find first SJ that we participate in */
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
-
-		if (sjinfo->jointype == JOIN_INNER)
-			continue;
-
-		if (!(bms_overlap(all_relids, sjinfo->min_lefthand) ||
-			  bms_overlap(all_relids, sjinfo->min_righthand)))
-			continue;
-
-		bms_free(all_relids);
-		return true;
-	}
-
-	bms_free(all_relids);
-	return false;
+	/* 
+	 * There may be more fine-grained checks, but for small OLTP queries
+	 * this will introduce too much overhead.
+	 * So, just check whether or not we have SJ in query at all.
+	 */
+	return root->join_info_list != NIL;
 }
 
 static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
 	List *result;
+	List *saved_join_rel_list;
 
 	if (!dphyp_enabled ||
 		BITS_PER_BITMAPWORD <= levels_needed ||
-		(dphyp_skip_sj && contains_sj(root, initial_rels)))
+		(dphyp_skip_sj && contains_sj(root)))
 	{
 		if (prev_join_search_hook)
 			return prev_join_search_hook(root, levels_needed, initial_rels);
@@ -85,15 +55,28 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 		return standard_join_search(root, levels_needed, initial_rels);
 	}
 
-	result = dphyp(root, levels_needed, initial_rels);
+	/* 
+	 * Before proceeding we store 'join_rel_list' in case we fail
+	 * to find query plan.  Restore it before proceeding to DPsize otherwise
+	 * it will throw "failed to build %d-way join"
+	 */
+	saved_join_rel_list = list_copy(root->join_rel_list);
 
+	result = dphyp(root, levels_needed, initial_rels);	
+
+	
 	/* Successfully found join order */
 	if (list_length(result) == 1)
 	{
 		RelOptInfo *rel = linitial(result);
+		list_free(saved_join_rel_list);
 		list_free(result);
 		return rel;
 	}
+	
+	/* Restore state before proceeding to DPsize/GEQO */
+	list_free(root->join_rel_list);
+	root->join_rel_list = saved_join_rel_list;
 
 	/* 
 	 * Single relation in List means we successfully found query plan.
@@ -105,16 +88,21 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 	 * First case means we can not do anything, so pass 'initial_rels' to conventional DPsize/GEQO.
 	 * The second case means we have implicit joins, but plans for disjoint sets are found - pass what we have found to DPsize/GEQO.
 	 */
+
 	if (result == NIL)
 	{
-		result = initial_rels;
+		if (prev_join_search_hook)
+			return prev_join_search_hook(root, levels_needed, initial_rels);
+		if (enable_geqo && levels_needed >= geqo_threshold)
+			return geqo(root, levels_needed, initial_rels);
+		return standard_join_search(root, levels_needed, initial_rels);
 	}
 
 	if (prev_join_search_hook)
-		return prev_join_search_hook(root, levels_needed, result);
-	if (enable_geqo && levels_needed >= geqo_threshold)
-		return geqo(root, levels_needed, result);
-	return standard_join_search(root, levels_needed, result);
+		return prev_join_search_hook(root, list_length(result), result);
+	if (enable_geqo && list_length(result) >= geqo_threshold)
+		return geqo(root, list_length(result), result);
+	return standard_join_search(root, list_length(result), result);
 }
 
 void
