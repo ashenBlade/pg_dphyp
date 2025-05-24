@@ -31,6 +31,8 @@ typedef struct HyperNode
 	 */
 	RelOptInfo *rel;
 
+	List *candidates;
+
 	/*
 	 * List of hyperedges, that this node belongs to.
 	 * Each hypernode is represented as List of nodes and each node is bitmapword - Cross Join Set.
@@ -64,11 +66,20 @@ typedef struct DPHypContext
 	 */
 	HTAB *dptable;
 
-
+	/* 
+	 * Cached bitmap of all nodes appearing in query.
+	 * Used in 'emit_csg_cmp' when checking rel before
+	 * calling 'generate_useful_gather_paths'.
+	 */
 	bitmapword all_query_nodes;
 } DPHypContext;
 
 static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes);
+
+static inline bool hypernode_has_rel(HyperNode *node)
+{
+	return node->rel != NULL || node->candidates != NIL;
+}
 
 static HTAB *create_dptable(List *base_hypernodes)
 {
@@ -95,6 +106,7 @@ static HTAB *create_dptable(List *base_hypernodes)
 		Assert(!found);
 
 		entry->rel = node->rel;
+		entry->candidates = node->candidates;
 		entry->hyperedges = node->hyperedges;
 		entry->representative = node->representative;
 		entry->nodes = node->nodes;
@@ -278,8 +290,8 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 	/*
 	 * For this moment, RelOptInfo for both subgroup and complement must exist
 	 */
-	Assert(subgroup->rel);
-	Assert(complement->rel);
+	// Assert(subgroup->rel);
+	// Assert(complement->rel);
 
 	nodes = bmw_union(subgroup->nodes, complement->nodes);
 	hypernode = get_hypernode(context, nodes);
@@ -295,6 +307,10 @@ static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *
 	 * In such cases we can not create 'RelOptInfo' and 'make_join_rel' will
 	 * just return NULL.
 	 */
+	hypernode->candidates = lappend(hypernode->candidates, list_make2(subgroup, complement));
+
+	return;
+
 	joinrel = make_join_rel(context->root, subgroup->rel, complement->rel);
 	if (!joinrel)
 		return;
@@ -331,7 +347,7 @@ static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, Hype
 		neighbor_superset = bmw_union(complement->nodes, subset);
 		superset_node = get_hypernode(context, neighbor_superset);
 
-		if (superset_node->rel != NULL &&
+		if (hypernode_has_rel(superset_node) &&
 			hypernode_has_edge_with(node, neighbor_superset))
 			emit_csg_cmp(context, node, superset_node);
 	}
@@ -407,7 +423,7 @@ static void enumerate_csg_recursive(DPHypContext *context, HyperNode *node, bitm
 		HyperNode *subnode;
 
 		subnode = get_hypernode(context, superset);
-		if (subnode->rel != NULL)
+		if (hypernode_has_rel(subnode))
 			emit_csg(context, subnode);
 	}
 
@@ -634,6 +650,7 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 
 	node->hyperedges = edges;
 	node->rel = rel;
+	node->candidates = NIL;
 	node->representative = id;
 	node->nodes = bmw_make_singleton(id);
 
@@ -663,6 +680,7 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 		node->nodes = nodes;
 		node->representative = bmw_first(nodes);
 		node->rel = NULL;
+		node->candidates = NIL;
 
 		hyperedges = NIL;
 
@@ -812,6 +830,55 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 	return node;
 }
 
+static RelOptInfo *hypernode_get_rel(DPHypContext *context, HyperNode *node)
+{
+	ListCell *lc;
+	RelOptInfo *rel;
+
+	if (node->rel != NULL)
+		return node->rel;
+	
+	rel = NULL;
+	foreach(lc, node->candidates)
+	{
+		HyperNode *node_left;
+		HyperNode *node_right;
+		RelOptInfo *rel_left;
+		RelOptInfo *rel_right;
+		RelOptInfo *join_rel;
+		List *pair = (List *)lfirst(lc);
+		
+		Assert(list_length(pair) == 2);
+
+		node_left = (HyperNode *)linitial(pair);
+		node_right = (HyperNode *)llast(pair);
+
+		rel_left = hypernode_get_rel(context, node_left);
+		if (rel_left == NULL)
+			continue;
+		rel_right = hypernode_get_rel(context, node_right);
+		if (rel_right == NULL)
+			continue;
+
+		join_rel = make_join_rel(context->root, rel_left, rel_right);
+		if (join_rel == NULL)
+			continue;
+		
+		if (rel == NULL)
+			rel = join_rel;
+	}
+
+	if (rel == NULL)
+		return NULL;
+
+	generate_partitionwise_join_paths(context->root, rel);
+    if (!bmw_equal(context->all_query_nodes, node->nodes))
+		generate_useful_gather_paths(context->root, rel, false);
+	set_cheapest(rel);
+	node->rel = rel;
+	return rel;
+}
+
 static List *collect_disjoint_relations(DPHypContext *context)
 {
 	/*
@@ -874,6 +941,7 @@ static List *collect_disjoint_relations(DPHypContext *context)
 		HyperNode *hypernode;
 		Bitmapset *disjoint_set = (Bitmapset *)lfirst(lc);
 		bitmapword simple_disjoint_set = 0;
+		RelOptInfo *rel;
 		int i;
 
 		i = -1;
@@ -883,14 +951,15 @@ static List *collect_disjoint_relations(DPHypContext *context)
 		}
 
 		hypernode = get_hypernode(context, simple_disjoint_set);
-		if (hypernode->rel == NULL)
+		rel = hypernode_get_rel(context, hypernode);
+		if (rel == NULL)
 		{
 			us_free(&us_state);
 			list_free(disjoint_sets);
 			return NIL;
 		}
 
-		disjoint_relations = lappend(disjoint_relations, hypernode->rel);
+		disjoint_relations = lappend(disjoint_relations, rel);
 	}
 
 	list_free(disjoint_sets);
@@ -898,7 +967,6 @@ static List *collect_disjoint_relations(DPHypContext *context)
 
 	return disjoint_relations;
 }
-
 
 List *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
@@ -936,13 +1004,13 @@ List *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
 	solve(&context);
 	
 	result = hash_search(dptable, &context.all_query_nodes, HASH_FIND, &result_found);
-	if (result && result->rel)
-		return list_make1(result->rel);
+	if (result && result->candidates != NIL)
+	{
+		RelOptInfo *rel = hypernode_get_rel(&context, result);
+		if (rel)
+			return list_make1(rel);
+	}
 
-	/* SJ are not handled by this DPhyp correctly */
-	if (root->join_info_list)
-		return NIL;
-	
 	/* If we failed to create plan for whole relation, maybe there are implicit joins */
 	return collect_disjoint_relations(&context);
 }
