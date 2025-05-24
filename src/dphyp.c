@@ -604,6 +604,34 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 		}
 	}
 
+	/* 
+	 * OUTER JOINs impose restrictions for join order. Notably, even if
+	 * we have some join clause 'a.x = b.x' this does not mean we have to
+	 * join only 'a' and 'b', because this can be RIGHT JOIN clause and
+	 * then we must join 'b' with 'a' + all relations on left part.
+	 * So, all SpecialJoinInfo create hyperedge.
+	 */
+	foreach (lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *)lfirst(lc);
+		bitmapword left_bmw;
+		bitmapword right_bmw;
+		if (sjinfo->jointype == JOIN_INNER)
+			continue;
+		
+		if (!(bms_is_subset(rel->relids, sjinfo->min_lefthand) ||
+			  bms_is_subset(rel->relids, sjinfo->min_righthand)))
+			continue;
+		
+		left_bmw = map_to_internal_bms(initial_rels, sjinfo->min_lefthand);
+		if (bmw_is_empty(left_bmw))
+			continue;
+		right_bmw = map_to_internal_bms(initial_rels, sjinfo->min_righthand);
+		if (bmw_is_empty(right_bmw))
+			continue;
+		edges = lappend(edges, list_make2((void *)left_bmw, (void *)right_bmw));
+	}
+
 	node->hyperedges = edges;
 	node->rel = rel;
 	node->representative = id;

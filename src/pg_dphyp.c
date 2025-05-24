@@ -22,7 +22,7 @@ static join_search_hook_type prev_join_search_hook = NULL;
 /* Extension is enabled and should run DPhyp */
 static bool dphyp_enabled = true;
 /* Do not apply DPhyp if SJ found (LEFT/RIGHT/OUTER etc...) */
-static bool dphyp_skip_sj = true;
+static bool dphyp_skip_sj = false;
 /* Threshold for GEQO used by DPhyp */
 static int dphyp_geqo_threshold = 12;
 
