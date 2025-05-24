@@ -41,7 +41,7 @@ static inline bool contains_sj(PlannerInfo *root)
 
 static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
-	List *result;
+	RelOptInfo *rel;
 	List *saved_join_rel_list;
 
 	if (!dphyp_enabled ||
@@ -62,47 +62,26 @@ static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List 
 	 */
 	saved_join_rel_list = list_copy(root->join_rel_list);
 
-	result = dphyp(root, levels_needed, initial_rels);	
+	rel = dphyp(root, levels_needed, initial_rels);	
 
 	
 	/* Successfully found join order */
-	if (list_length(result) == 1)
+	if (rel)
 	{
-		RelOptInfo *rel = linitial(result);
 		list_free(saved_join_rel_list);
-		list_free(result);
 		return rel;
 	}
-	
+
 	/* Restore state before proceeding to DPsize/GEQO */
 	list_free(root->join_rel_list);
 	root->join_rel_list = saved_join_rel_list;
 
-	/* 
-	 * Single relation in List means we successfully found query plan.
-	 * But we may fail and in this case we can have:
-	 * 
-	 * 1. NIL
-	 * 2. Any amount of relations
-	 * 
-	 * First case means we can not do anything, so pass 'initial_rels' to conventional DPsize/GEQO.
-	 * The second case means we have implicit joins, but plans for disjoint sets are found - pass what we have found to DPsize/GEQO.
-	 */
-
-	if (result == NIL)
-	{
-		if (prev_join_search_hook)
-			return prev_join_search_hook(root, levels_needed, initial_rels);
-		if (enable_geqo && levels_needed >= geqo_threshold)
-			return geqo(root, levels_needed, initial_rels);
-		return standard_join_search(root, levels_needed, initial_rels);
-	}
-
+	/* Fallback to conventional DPsize/GEQO */
 	if (prev_join_search_hook)
-		return prev_join_search_hook(root, list_length(result), result);
-	if (enable_geqo && list_length(result) >= geqo_threshold)
-		return geqo(root, list_length(result), result);
-	return standard_join_search(root, list_length(result), result);
+		return prev_join_search_hook(root, levels_needed, initial_rels);
+	if (enable_geqo && levels_needed >= geqo_threshold)
+		return geqo(root, levels_needed, initial_rels);
+	return standard_join_search(root, levels_needed, initial_rels);
 }
 
 void

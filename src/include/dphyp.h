@@ -11,6 +11,6 @@
  * 1  - query plan found and single element is required plan
  * >1 - there are implicit joins found, so each element is a plan for such disjoint graph and this list should be passed to standard planner
  */
-List *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels);
+RelOptInfo *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels);
 
 #endif

@@ -3,7 +3,6 @@ EXTENSION = pg_dphyp
 MODULE_big = pg_dphyp
 OBJS = $(WIN32RES) \
 	src/pg_dphyp.o \
-	src/unionset.o \
 	src/dphyp.o
 
 PG_CPPFLAGS += -Isrc/include

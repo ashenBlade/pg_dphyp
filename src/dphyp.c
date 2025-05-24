@@ -5,7 +5,6 @@
 #include "miscadmin.h"
 
 #include "dphyp.h"
-#include "unionset.h"
 #include "simplebms.h"
 
 /*
@@ -879,96 +878,7 @@ static RelOptInfo *hypernode_get_rel(DPHypContext *context, HyperNode *node)
 	return rel;
 }
 
-static List *collect_disjoint_relations(DPHypContext *context)
-{
-	/*
-	 * When we encounter implicit 'CROSS JOIN's, then our hypergraph will not contain edges between these subgraphs, thus producing disjoint sets of graphs.
-	 * DPsize solves this problem just by creating each possible join of relations, but DPhyp will not detect this.
-	 *
-	 * If there is no 'RelOptInfo' created for top level hypernode, it means we have implicit 'CROSS JOIN's and have to handle it.
-	 * We solve this collecting already solved problems (subgraphs) and running DPsize/GEQO with new 'RelOptInfo' set.
-	 * To collect all disjoint sets we use UNION-SET structure with ID of hypernode as key for sets.
-	 */
-	List *disjoint_relations;
-	List *disjoint_sets;
-	ListCell *lc;
-	unionset_state us_state;
-	int num_leaders;
-
-	num_leaders = list_length(context->initial_rels);
-	us_init(&us_state, num_leaders);
-
-	/* Generate sets */
-	foreach(lc, context->base_hypernodes)
-	{
-		HyperNode *node = (HyperNode *)lfirst(lc);
-		ListCell *lc_edge;
-		foreach(lc_edge, node->hyperedges)
-		{
-			ListCell *lc_vertex;
-			List *edge = (List *)lfirst(lc_edge);
-
-			foreach(lc_vertex, edge)
-			{
-				bitmapword vertex = (bitmapword )lfirst(lc_vertex);
-				int i = -1;
-				while ((i = bmw_next_member(vertex, i)) >= 0)
-				{
-					if (node->representative != i)
-						us_union(&us_state, node->representative, i);
-				}
-			}
-		}
-	}
-
-	/* Collect all disjoint sets */
-	disjoint_sets = us_collect(&us_state);
-
-	/*
-	 * Currently, we can not handle some queries with complex query-tree structures.
-	 * i.e. with lots of LEFT/RIGHT/OUTER JOIN's
-	 *
-	 * For these cases, we return NIL as a signal to run DPsize/GEQO (fallback)
-	 */
-	Assert(disjoint_sets != NIL);
-	if (list_length(disjoint_sets) == 1)
-		return NIL;
-
-	/* Iterate through all disjoint sets and collect 'RelOptInfo' for them */
-	disjoint_relations = NIL;
-	foreach(lc, disjoint_sets)
-	{
-		HyperNode *hypernode;
-		Bitmapset *disjoint_set = (Bitmapset *)lfirst(lc);
-		bitmapword simple_disjoint_set = 0;
-		RelOptInfo *rel;
-		int i;
-
-		i = -1;
-		while ((i = bms_next_member(disjoint_set, i)) >= 0)
-		{
-			simple_disjoint_set = bmw_add_member(simple_disjoint_set, i);
-		}
-
-		hypernode = get_hypernode(context, simple_disjoint_set);
-		rel = hypernode_get_rel(context, hypernode);
-		if (rel == NULL)
-		{
-			us_free(&us_state);
-			list_free(disjoint_sets);
-			return NIL;
-		}
-
-		disjoint_relations = lappend(disjoint_relations, rel);
-	}
-
-	list_free(disjoint_sets);
-	us_free(&us_state);
-
-	return disjoint_relations;
-}
-
-List *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
+RelOptInfo *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
 	HTAB *dptable;
 	HyperNode *result;
@@ -1004,13 +914,8 @@ List *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
 	solve(&context);
 	
 	result = hash_search(dptable, &context.all_query_nodes, HASH_FIND, &result_found);
-	if (result && result->candidates != NIL)
-	{
-		RelOptInfo *rel = hypernode_get_rel(&context, result);
-		if (rel)
-			return list_make1(rel);
-	}
+	if (!(result && result->candidates))
+		return NULL;
 
-	/* If we failed to create plan for whole relation, maybe there are implicit joins */
-	return collect_disjoint_relations(&context);
+	return hypernode_get_rel(&context, result);
 }
