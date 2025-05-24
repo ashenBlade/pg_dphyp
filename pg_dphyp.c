@@ -1,11 +1,31 @@
 #include "postgres.h"
-#include "utils/hsearch.h"
+#include "fmgr.h"
+#include "nodes/bitmapset.h"
+#include "optimizer/geqo.h"
 #include "optimizer/paths.h"
 #include "optimizer/pathnode.h"
+#include "utils/builtins.h"
+#include "utils/hsearch.h"
+#include "utils/guc.h"
 #include "miscadmin.h"
+#include "limits.h"
 
-#include "dphyp.h"
 #include "simplebms.h"
+
+PG_MODULE_MAGIC;
+
+static join_search_hook_type prev_join_search_hook = NULL;
+
+/* GUC */
+/* Extension is enabled and should run DPhyp */
+static bool dphyp_enabled = true;
+/* Do not apply DPhyp if SJ found (LEFT/RIGHT/OUTER etc...) */
+static bool dphyp_skip_sj = false;
+/* Threshold for GEQO used by DPhyp */
+static int dphyp_geqo_threshold = 12;
+
+void _PG_init(void);
+void _PG_fini(void);
 
 /*
  * Represents a hypernode in query graph
@@ -25,11 +45,17 @@ typedef struct HyperNode
 
 	/*
 	 * Created 'RelOptInfo' for this HyperNode.
-	 * May be NULL in cases it is created on demand and used transiently (to pass
-	 * as argument)
+	 * During DPhyp algorithm this is not NULL only for base hypernodes.
+	 * At the end of algorithm we build RelOptInfo for all 
 	 */
 	RelOptInfo *rel;
 
+	/* 
+	 * List of Hypernode pairs, that can contribute for creating this HyperNode.
+	 * Used as an indicator that this HyperNode has a plan and can be created,
+	 * even if actually 'make_join_rel' will not be able to create RelOptInfo
+	 * from it.
+	 */
 	List *candidates;
 
 	/*
@@ -73,52 +99,75 @@ typedef struct DPHypContext
 	bitmapword all_query_nodes;
 } DPHypContext;
 
-static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes);
 
+static HTAB *create_dptable(List *base_hypernodes);
+static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel,
+										   int id, List *initial_rels);
+static bitmapword map_to_internal_bms(List *initial_rels, Bitmapset *original);
+
+static int bmw_list_comparator(const ListCell *a, const ListCell *b);
+static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes);
+static bitmapword get_neighbors(HyperNode *node, bitmapword excluded);
+static bool hypernode_has_direct_edge_with(HyperNode *node, int id);
+static bool hypernode_has_edge_with(HyperNode *node, bitmapword bms);
+static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup,
+						 HyperNode *complement);
+static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node,
+									HyperNode *complement, bitmapword excluded);
+static void emit_csg(DPHypContext *context, HyperNode *node);
+static void enumerate_csg_recursive(DPHypContext *context, HyperNode *node,
+									bitmapword excluded);
+static void solve(DPHypContext *context);
+static RelOptInfo *dphyp(PlannerInfo *root, List *initial_rels);
+static RelOptInfo *hypernode_get_rel(DPHypContext *context, HyperNode *node);
+static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed,
+									 List *initial_rels);
+
+/* 
+ * Structure used as state for enumerating subsets of given bitmap
+ */
+typedef struct
+{
+	/*
+	 * Current subset to return. 0 means no more subsets.
+	 */
+	bitmapword state;
+	/* 
+	 * Initial bitmap that used as mask to iterate.
+	 */
+	bitmapword init;
+} SubsetIteratorState;
+static void subset_iterator_init(SubsetIteratorState *state, bitmapword bmw);
+static bool subset_iterator_next(SubsetIteratorState *state, bitmapword *result);
+
+/* 
+ * Check that we calculated any query plan for this hypernode
+ */
 static inline bool hypernode_has_rel(HyperNode *node)
 {
 	return node->rel != NULL || node->candidates != NIL;
 }
 
-static HTAB *create_dptable(List *base_hypernodes)
+/* 
+ * Check that query contains any special joins (LEFT/ANTI/SEMI etc...)
+ */
+static inline bool contains_sj(PlannerInfo *root)
 {
-	ListCell *lc;
-	HTAB *dptable;
-	HASHCTL hctl;
-
-	/* Initial size of HTAB given from 'build_join_rel_hash' */
-	hctl.keysize = sizeof(bitmapword);
-	hctl.entrysize = sizeof(HyperNode);
-	hctl.hash = bmw_hash;
-	hctl.match = bmw_match;
-	hctl.hcxt = CurrentMemoryContext;
-	dptable = (HTAB *)hash_create("DPhypHyperNodeHashTable", 256L, &hctl,
-								  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
-
-	foreach (lc, base_hypernodes)
-	{
-		HyperNode *node = (HyperNode *)lfirst(lc);
-		HyperNode *entry;
-		bool found;
-
-		entry = (HyperNode *) hash_search(dptable, &node->nodes, HASH_ENTER, &found);
-		Assert(!found);
-
-		entry->rel = node->rel;
-		entry->candidates = node->candidates;
-		entry->hyperedges = node->hyperedges;
-		entry->representative = node->representative;
-		entry->nodes = node->nodes;
-	}
-
-	return dptable;
+	/* 
+	 * There may be more fine-grained checks, but for small OLTP queries
+	 * this will introduce too much overhead.
+	 * So, just check whether or not we have SJ in query at all.
+	 */
+	return root->join_info_list != NIL;
 }
 
-/**
+
+/*
  * Get gitmap of neighbors for node excluding all specified.
  * Corresponds to 'N(S, X)' function in paper.
  */
-static bitmapword get_neighbors(HyperNode *node, bitmapword excluded)
+static bitmapword
+get_neighbors(HyperNode *node, bitmapword excluded)
 {
 	/*
 	 * Neighbors of hypernode are just all reachable nodes from this node
@@ -191,7 +240,8 @@ static bitmapword get_neighbors(HyperNode *node, bitmapword excluded)
  * This is not the same as 'has_edge_with' because we must check
  * that it has *direct* edge.
  */
-static bool hypernode_has_direct_edge_with(HyperNode *node, int id)
+static bool
+hypernode_has_direct_edge_with(HyperNode *node, int id)
 {
 	ListCell *lc;
 	bitmapword bmw;
@@ -232,7 +282,8 @@ static bool hypernode_has_direct_edge_with(HyperNode *node, int id)
 /*
  * Check that 'node' has any edge that can be used as connection to 'bms'
  */
-static bool hypernode_has_edge_with(HyperNode *node, bitmapword bms)
+static bool
+hypernode_has_edge_with(HyperNode *node, bitmapword bms)
 {
 	ListCell *lc;
 
@@ -258,19 +309,15 @@ static bool hypernode_has_edge_with(HyperNode *node, bitmapword bms)
 	return false;
 }
 
-typedef struct
-{
-	bitmapword state;
-	bitmapword init;
-} SubsetIteratorState;
-
-static void subset_iterator_init(SubsetIteratorState *state, bitmapword bmw)
+static void
+subset_iterator_init(SubsetIteratorState *state, bitmapword bmw)
 {
 	state->init = bmw;
 	state->state = (-bmw) & bmw;
 }
 
-static bool subset_iterator_next(SubsetIteratorState *state, bitmapword *result)
+static bool
+subset_iterator_next(SubsetIteratorState *state, bitmapword *result)
 {
 	if (state->state == 0)
 		return false;
@@ -280,54 +327,33 @@ static bool subset_iterator_next(SubsetIteratorState *state, bitmapword *result)
 	return true;
 }
 
-static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *complement)
+static void
+emit_csg_cmp(DPHypContext *context, HyperNode *subgroup, HyperNode *complement)
 {
 	bitmapword nodes;
-	RelOptInfo *joinrel;
 	HyperNode *hypernode;
 
-	/*
-	 * For this moment, RelOptInfo for both subgroup and complement must exist
+	/* 
+	 * Now we do not create 'RelOptInfo' for this join, but instead
+	 * save pair of hypernodes that can be joined together.
+	 * 
+	 * PostgreSQL's planner designed highly cohesion with DPsize algorithm,
+	 * so during processing 1 level of join we just call 'make_join_rel'
+	 * with nodes of lower level and add more available paths and at the
+	 * end we call 'set_cheapest' to find best paths among discovered.
+	 * It would be easier to code to just call 'make_join_rel' here and
+	 * 'set_cheapest' at the end, but we can not do this, because 'make_join_rel'
+	 * expects that 'set_cheapest' was already called with rel at lower level.
+	 * So adding 'make_join_rel' + 'set_cheapest' (and some other functions)
+	 * here will add overhead by calling them multiple times for same rel.
 	 */
-	// Assert(subgroup->rel);
-	// Assert(complement->rel);
-
 	nodes = bmw_union(subgroup->nodes, complement->nodes);
 	hypernode = get_hypernode(context, nodes);
-
-	/*
-	 * Our DPhyp logic reuse code from original postgres' DPsize algorithm.
-	 * And main function - is 'make_join_rel' which actually creates 'RelOptInfo'
-	 * and find all possible paths.
-	 *
-	 * Current implementation works well with INNER JOIN, but in case of
-	 * outer joins (LEFT/SEMI/ANTI/OUTER etc...) it can misbehave due to
-	 * join ordering restrictions imposed by outer joints.
-	 * In such cases we can not create 'RelOptInfo' and 'make_join_rel' will
-	 * just return NULL.
-	 */
 	hypernode->candidates = lappend(hypernode->candidates, list_make2(subgroup, complement));
-
-	return;
-
-	joinrel = make_join_rel(context->root, subgroup->rel, complement->rel);
-	if (!joinrel)
-		return;
-		
-	/*
-	 * Find best path for this rel or update existing one.
-	 * Code copied from 'standard_join_search'.
-	 */
-	generate_partitionwise_join_paths(context->root, joinrel);
-    if (!bmw_equal(context->all_query_nodes, hypernode->nodes))
-		generate_useful_gather_paths(context->root, joinrel, false);
-	set_cheapest(joinrel);
-
-	if (hypernode->rel == NULL)
-		hypernode->rel = joinrel;
 }
 
-static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, HyperNode *complement, bitmapword excluded)
+static void
+enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, HyperNode *complement, bitmapword excluded)
 {
 	bitmapword complement_neighbors;
 	SubsetIteratorState subset_iter;
@@ -370,7 +396,8 @@ static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, Hype
 	}
 }
 
-static void emit_csg(DPHypContext *context, HyperNode *node)
+static void
+emit_csg(DPHypContext *context, HyperNode *node)
 {
 	bitmapword excluded;
 	bitmapword neighbors;
@@ -404,7 +431,8 @@ static void emit_csg(DPHypContext *context, HyperNode *node)
 	}
 }
 
-static void enumerate_csg_recursive(DPHypContext *context, HyperNode *node, bitmapword excluded)
+static void
+enumerate_csg_recursive(DPHypContext *context, HyperNode *node, bitmapword excluded)
 {
 	SubsetIteratorState subset_iter;
 	bitmapword subset;
@@ -439,7 +467,8 @@ static void enumerate_csg_recursive(DPHypContext *context, HyperNode *node, bitm
 	}
 }
 
-static void solve(DPHypContext *context)
+static void
+solve(DPHypContext *context)
 {
 	int base_hypernodes_count = list_length(context->base_hypernodes);
 
@@ -461,7 +490,8 @@ static void solve(DPHypContext *context)
 /*
  * Map Relids specified in 'original' to internal presentation based on id of relation
  */
-static bitmapword map_to_internal_bms(List *initial_rels, Bitmapset *original)
+static bitmapword
+map_to_internal_bms(List *initial_rels, Bitmapset *original)
 {
 	bitmapword target;
 	ListCell *lc;
@@ -483,7 +513,8 @@ static bitmapword map_to_internal_bms(List *initial_rels, Bitmapset *original)
 	return target;
 }
 
-static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, int id, List *initial_rels)
+static HyperNode *
+create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, int id, List *initial_rels)
 {
 	HyperNode *node;
 	List *edges;
@@ -656,14 +687,16 @@ static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, i
 	return node;
 }
 
-static int bmw_list_comparator(const ListCell *a, const ListCell *b)
+static int
+bmw_list_comparator(const ListCell *a, const ListCell *b)
 {
 	bitmapword a_nodes = (bitmapword)lfirst(a);
 	bitmapword b_nodes = (bitmapword)lfirst(b);
 	return a_nodes - b_nodes;
 }
 
-static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
+static HyperNode *
+get_hypernode(DPHypContext *context, bitmapword nodes)
 {
 	HyperNode *node;
 	bitmapword key = nodes;
@@ -829,14 +862,19 @@ static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes)
 	return node;
 }
 
-static RelOptInfo *hypernode_get_rel(DPHypContext *context, HyperNode *node)
+/* 
+ * Get 'RelOptInfo' for given 'HyperNode' and possibly building it.
+ * This is called at the end of DPhyp when we are building plan.
+ */
+static RelOptInfo *
+hypernode_get_rel(DPHypContext *context, HyperNode *node)
 {
 	ListCell *lc;
 	RelOptInfo *rel;
 
 	if (node->rel != NULL)
 		return node->rel;
-	
+
 	rel = NULL;
 	foreach(lc, node->candidates)
 	{
@@ -868,7 +906,15 @@ static RelOptInfo *hypernode_get_rel(DPHypContext *context, HyperNode *node)
 	}
 
 	if (rel == NULL)
+	{
+		/* 
+		 * If we are here, then we are unable to create rel from this node,
+		 * then mark this node as invalid to prevent multiple recursive calls
+		 * by clearing candidate List.
+		 */
+		node->candidates = NIL;
 		return NULL;
+	}
 
 	generate_partitionwise_join_paths(context->root, rel);
     if (!bmw_equal(context->all_query_nodes, node->nodes))
@@ -878,7 +924,43 @@ static RelOptInfo *hypernode_get_rel(DPHypContext *context, HyperNode *node)
 	return rel;
 }
 
-RelOptInfo *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
+static HTAB *
+create_dptable(List *base_hypernodes)
+{
+	ListCell *lc;
+	HTAB *dptable;
+	HASHCTL hctl;
+
+	/* Initial size of HTAB given from 'build_join_rel_hash' */
+	hctl.keysize = sizeof(bitmapword);
+	hctl.entrysize = sizeof(HyperNode);
+	hctl.hash = bmw_hash;
+	hctl.match = bmw_match;
+	hctl.hcxt = CurrentMemoryContext;
+	dptable = (HTAB *)hash_create("DPhypHyperNodeHashTable", 256L, &hctl,
+								  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+
+	foreach (lc, base_hypernodes)
+	{
+		HyperNode *node = (HyperNode *)lfirst(lc);
+		HyperNode *entry;
+		bool found;
+
+		entry = (HyperNode *) hash_search(dptable, &node->nodes, HASH_ENTER, &found);
+		Assert(!found);
+
+		entry->rel = node->rel;
+		entry->candidates = node->candidates;
+		entry->hyperedges = node->hyperedges;
+		entry->representative = node->representative;
+		entry->nodes = node->nodes;
+	}
+
+	return dptable;
+}
+
+static RelOptInfo *
+dphyp(PlannerInfo *root, List *initial_rels)
 {
 	HTAB *dptable;
 	HyperNode *result;
@@ -892,6 +974,10 @@ RelOptInfo *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
 	id = 0;
 	foreach(lc, initial_rels)
 	{
+		/* 
+		 * TODO: create hyperedges and distributes them among hypernodes
+		 * 		 instead of creating their own copy for each hypernode.
+		 */
 		RelOptInfo *rel = (RelOptInfo *)lfirst(lc);
 		HyperNode *node;
 
@@ -918,4 +1004,87 @@ RelOptInfo *dphyp(PlannerInfo *root, int levels_needed, List *initial_rels)
 		return NULL;
 
 	return hypernode_get_rel(&context, result);
+}
+
+static RelOptInfo *
+dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+{
+	RelOptInfo *rel;
+	List *saved_join_rel_list;
+
+	if (!dphyp_enabled ||
+		BITS_PER_BITMAPWORD <= levels_needed ||
+		(dphyp_skip_sj && contains_sj(root)))
+	{
+		if (prev_join_search_hook)
+			return prev_join_search_hook(root, levels_needed, initial_rels);
+		if (enable_geqo && levels_needed >= geqo_threshold)
+			return geqo(root, levels_needed, initial_rels);
+		return standard_join_search(root, levels_needed, initial_rels);
+	}
+
+	/* 
+	 * Before proceeding we store 'join_rel_list' in case we fail
+	 * to find query plan.  Restore it before proceeding to DPsize otherwise
+	 * it will throw "failed to build %d-way join"
+	 */
+	saved_join_rel_list = list_copy(root->join_rel_list);
+
+	rel = dphyp(root, initial_rels);	
+
+	
+	/* Successfully found join order */
+	if (rel)
+	{
+		list_free(saved_join_rel_list);
+		return rel;
+	}
+
+	/* Restore state before proceeding to DPsize/GEQO */
+	list_free(root->join_rel_list);
+	root->join_rel_list = saved_join_rel_list;
+
+	/* Fallback to conventional DPsize/GEQO */
+	if (prev_join_search_hook)
+		return prev_join_search_hook(root, levels_needed, initial_rels);
+	if (enable_geqo && levels_needed >= geqo_threshold)
+		return geqo(root, levels_needed, initial_rels);
+	return standard_join_search(root, levels_needed, initial_rels);
+}
+
+void
+_PG_init(void)
+{
+	DefineCustomBoolVariable("pg_dphyp.enabled",
+							 "pg_dphyp join enumeration algorithm is enabled",
+							 NULL,
+							 &dphyp_enabled,
+							 dphyp_enabled,
+							 PGC_USERSET,
+							 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_dphyp.skip_sj",
+							 "Do not run DPhyp if any special join detected",
+							 NULL,
+							 &dphyp_skip_sj,
+							 dphyp_skip_sj,
+							 PGC_USERSET,
+							 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("pg_dphyp.geqo_threshold",
+							"Sets the threshold of FROM items beyond which DPhyp algorithm will not be used.",
+							NULL,
+							&dphyp_geqo_threshold,
+							dphyp_geqo_threshold,
+							2, BITS_PER_BITMAPWORD - 1,
+							PGC_USERSET,
+							0, NULL, NULL, NULL);
+	MarkGUCPrefixReserved("pg_dphyp");
+
+	prev_join_search_hook = join_search_hook;
+	join_search_hook = dphyp_join_search;
+}
+
+void
+_PG_fini(void)
+{
+	join_search_hook = prev_join_search_hook;
 }

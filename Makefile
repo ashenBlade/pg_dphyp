@@ -1,9 +1,7 @@
 EXTENSION = pg_dphyp
 
 MODULE_big = pg_dphyp
-OBJS = $(WIN32RES) \
-	src/pg_dphyp.o \
-	src/dphyp.o
+OBJS = $(WIN32RES) pg_dphyp.o
 
 PG_CPPFLAGS += -Isrc/include
 
