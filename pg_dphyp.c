@@ -56,13 +56,54 @@ typedef struct HyperNode
 	 */
 	List *candidates;
 
-	/*
-	 * List of hyperedges, that this node belongs to.
-	 * Each hypernode is represented as List of nodes and each node is bitmapword - Cross Join Set.
-	 * Also, each hyperedge not only contains 2 nodes, but any count.
+	/* 
+	 * Cached bitmap of nodes that are connected with this HyperNode
+	 * with simple edges.
+	 * Just bit OR of 'simple_edges' of all 'nodes'.
 	 */
-	List *hyperedges;
+	bitmapword simple_edges;
 } HyperNode;
+
+typedef struct HyperEdge
+{
+	bitmapword left;
+	bitmapword right;
+} HyperEdge;
+
+typedef struct EdgeArray
+{
+	int capacity;
+	int size;
+	HyperEdge *edges;
+} EdgeArray;
+
+static inline bool hyperedge_is_simple(HyperEdge edge)
+{
+	return !bmw_is_singleton(bmw_union(edge.left, edge.right));
+}
+
+static inline bool
+hyperedge_is_valid(HyperEdge edge)
+{
+	/* 
+	 * Vertexes must be not empty and they must not intersect
+	 */
+	return !(   bmw_is_empty(edge.left) 
+			 || bmw_is_empty(edge.right)
+			 || bmw_overlap(edge.left, edge.right));
+}
+
+static inline int hyperedge_cmp(HyperEdge a, HyperEdge b)
+{
+	/* 
+	 * Simple integer tuple comparison
+	 */
+	bitmapword t = a.left - b.left;
+	if (t != 0)
+		return t;
+	t = a.right - b.right;
+	return t;
+}
 
 /*
  * Context object, that passed along with any function invocation.
@@ -84,6 +125,21 @@ typedef struct DPHypContext
 	 */
 	List *base_hypernodes;
 
+	int edges_size;
+
+	/* 
+	 * Map of base hypernode to bitmaps containing all nodes
+	 * that node has simple edge with.
+	 */
+	bitmapword *simple_edges;
+
+	/* 
+	 * Array of hyperedges appearing in query graph. Index is id
+	 * of hypernode and each array contains all hyperedges that
+	 * this node appears in.
+	 */
+	EdgeArray *complex_edges;
+
 	/*
 	 * Dynamic programming table that maps: bitmapword -> HyperNode.
 	 */
@@ -100,14 +156,18 @@ typedef struct DPHypContext
 
 static HTAB *create_dptable(List *base_hypernodes);
 static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel,
-										   int id, List *initial_rels);
+										   int id, DPHypContext *context);
 static bitmapword map_to_internal_bms(List *initial_rels, Bitmapset *original);
-
-static int bmw_list_comparator(const ListCell *a, const ListCell *b);
+static void initialize_edges(PlannerInfo *root, List *initial_rels,
+							 DPHypContext *context);
+static void distribute_cjs(DPHypContext *context, bitmapword cjs);
+static void distribute_hyperedge(DPHypContext *context, HyperEdge edge);
+static HyperEdge hyperedge_swap(HyperEdge edge);
+static void hyperedge_array_add(EdgeArray *array, HyperEdge edge);
 static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes);
-static bitmapword get_neighbors(HyperNode *node, bitmapword excluded);
-static bool hypernode_has_direct_edge_with(HyperNode *node, int id);
-static bool hypernode_has_edge_with(HyperNode *node, bitmapword bms);
+static bitmapword get_neighbors(DPHypContext *context, HyperNode *node, bitmapword excluded);
+static bool hypernode_has_direct_edge_with(DPHypContext *context, HyperNode *node, int id);
+static bool hypernode_has_edge_with(DPHypContext *context, HyperNode *node, bitmapword bms);
 static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup,
 						 HyperNode *complement);
 static void enumerate_cmp_recursive(DPHypContext *context, HyperNode *node,
@@ -165,141 +225,93 @@ static inline bool contains_sj(PlannerInfo *root)
  * Corresponds to 'N(S, X)' function in paper.
  */
 static bitmapword
-get_neighbors(HyperNode *node, bitmapword excluded)
+get_neighbors(DPHypContext *context, HyperNode *node, bitmapword excluded)
 {
-	/*
-	 * Neighbors of hypernode are just all reachable nodes from this node
-	 * except excluded.
-	 * In such setting, all we need to do is to iterate through all edges
-	 * and collect neighbors.
-	 */
-	ListCell *lc;
 	bitmapword neighbors;
+	int idx;
+	
+	/* Collect neighbors from simple edges */
+	neighbors = node->simple_edges;
 
-	neighbors = 0;
-	foreach (lc, node->hyperedges)
+	/* And then from complex only if they do not overlap with excluded */
+	idx = -1;
+	while ((idx = bmw_next_member(node->nodes, idx)) >= 0)
 	{
-		List *edge = (List *)lfirst(lc);
-		ListCell *lc2;
-
-		foreach (lc2, edge)
+		EdgeArray *edges = &context->complex_edges[idx];
+		for (int i = 0; i < edges->size; i++)
 		{
-			bitmapword set = (bitmapword )lfirst(lc2);
-
-			/*
-			 * With concept of Cross Join Sets logic changes a bit - we must
-			 * separately handle CJS that contains current node from those that don't.
-			 *
-			 * If current edge node contains us, then we implicitly join ourself
-			 * with every node in that node - treat as multiple CROSS JOIN edges.
-			 * So calculate difference '(edge_node / node) / excluded' and add all to our neighbors.
-			 *
-			 * Otherwise, treat as plain usual edge just like in paper - check
-			 * it does not contain any excluded nodes and add only representative.
-			 */
-			if (bmw_overlap(set, node->nodes))
+			HyperEdge edge = edges->edges[i];
+			if ( bmw_is_subset(edge.left, node->nodes) &&
+				!bmw_overlap(edge.right, neighbors))
 			{
-				bitmapword me_excluded;
-				bitmapword without_excluded;
-
-				/* Excluded myself from edge */
-				me_excluded = bmw_difference(set, node->nodes);
-				if (bmw_is_empty(me_excluded))
-					continue;
-
-				/* Exclude excluded nodes from what's left */
-				without_excluded = bmw_difference(me_excluded, excluded);
-				if (bmw_is_empty(without_excluded))
-					continue;
-
-				/* Add rest nodes from this CJS */
-				neighbors = bmw_union(neighbors, without_excluded);
-			}
-			else
-			{
-				int representative;
-
-				/* Proceed as in original paper - check no excluded and add representative */
-				if (bmw_overlap(set, excluded))
-					continue;
-
-				Assert(!bmw_is_empty(set));
-				representative = bmw_first(set);
-				neighbors = bmw_add_member(neighbors, representative);
+				neighbors = bmw_union(neighbors, bmw_first(edge.right));
 			}
 		}
 	}
 
+	neighbors = bmw_difference(neighbors, excluded);
 	return neighbors;
 }
 
 /*
  * Check that 'node' has direct edge with node 'id'.
  * This is not the same as 'has_edge_with' because we must check
- * that it has *direct* edge.
+ * that it has simple edge
  */
 static bool
-hypernode_has_direct_edge_with(HyperNode *node, int id)
+hypernode_has_direct_edge_with(DPHypContext *context, HyperNode *node, int id)
 {
-	ListCell *lc;
-	bitmapword bmw;
+	EdgeArray *edges;
+	bitmapword right_bmw;
 
-	Assert(!bmw_is_member(node->nodes, id));
+	/* If we have direct simple edge, then we are done */
+	if (bmw_is_member(node->simple_edges, id))
+		return true;
+	
+	/* Otherwise, we may have complex edge with single 'id' node at right side */
+	edges = &context->complex_edges[id];
 
-	bmw = bmw_make_singleton(id);
-	foreach (lc, node->hyperedges)
+	right_bmw = bmw_make_singleton(id);
+	for (int i = 0; i < edges->size; i++)
 	{
-		List *edge = (List *)lfirst(lc);
-		ListCell *lc2;
-		foreach (lc2, edge)
-		{
-			bitmapword vertex = (bitmapword )lfirst(lc2);
+		HyperEdge edge = edges->edges[i];
+		if (edge.left != right_bmw)
+			break;
 
-			if (bmw_is_subset(node->nodes, vertex))
-			{
-				/*
-				 * For CJS with us - check 'id' is member of edge
-				 */
-				if (bmw_is_member(vertex, id))
-					return true;
-			}
-			else
-			{
-				/*
-				 * For usual edges - check this is single element
-				 */
-				if (bmw_equal(vertex, bmw))
-					return true;
-			}
-		}
+		if (bmw_is_subset(node->nodes, edge.right))
+			return true;
 	}
 
 	return false;
 }
 
 /*
- * Check that 'node' has any edge that can be used as connection to 'bms'
+ * Check that 'node' has any edge that can be used as connection to 'bmw'.
+ * This is used to check that subgroup and complement can be connected
+ * to further call 'emit_csg_cmp' and create join rel for them.
  */
 static bool
-hypernode_has_edge_with(HyperNode *node, bitmapword bms)
+hypernode_has_edge_with(DPHypContext *context, HyperNode *node, bitmapword bmw)
 {
-	ListCell *lc;
+	int idx;
 
-	Assert(!bmw_overlap(node->nodes, bms));
+	Assert(!bmw_overlap(node->nodes, bmw));
 
-	foreach (lc, node->hyperedges)
+	/* Check that we have simple edges that connect to 'bmw' */
+	if (bmw_overlap(node->simple_edges, bmw))
+		return true;
+
+	/* Now check any complex edge has connection to 'bmw' */
+	idx = -1;
+	while ((idx = bmw_next_member(node->nodes, idx)) >= 0)
 	{
-		List *edge = (List *)lfirst(lc);
-		ListCell *lc2;
-		foreach (lc2, edge)
+		EdgeArray *edges = &context->complex_edges[idx];
+		
+		for (int i = 0; i < edges->size; i++)
 		{
-			bitmapword vertex = (bitmapword )lfirst(lc2);
-
-			/*
-			 * Of course, we may have vertex intersecting with node,
-			 * but logic is the same for both cases - check subset.
-			 */
-			if (bmw_is_subset(bms, vertex))
+			HyperEdge edge = edges->edges[i];
+			if (bmw_is_subset(edge.left, node->nodes) && 
+				bmw_is_subset(edge.right, bmw))
 				return true;
 		}
 	}
@@ -357,7 +369,7 @@ enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, HyperNode *compl
 	SubsetIteratorState subset_iter;
 	bitmapword subset;
 
-	complement_neighbors = get_neighbors(complement, excluded);
+	complement_neighbors = get_neighbors(context, complement, excluded);
 	if (bmw_is_empty(complement_neighbors))
 		return;
 
@@ -371,13 +383,13 @@ enumerate_cmp_recursive(DPHypContext *context, HyperNode *node, HyperNode *compl
 		superset_node = get_hypernode(context, neighbor_superset);
 
 		if (hypernode_has_rel(superset_node) &&
-			hypernode_has_edge_with(node, neighbor_superset))
+			hypernode_has_edge_with(context, node, neighbor_superset))
 			emit_csg_cmp(context, node, superset_node);
 	}
 
 	excluded = bmw_union(excluded, complement_neighbors);
 
-	complement_neighbors = get_neighbors(complement, excluded);
+	complement_neighbors = get_neighbors(context, complement, excluded);
 	if (bmw_is_empty(complement_neighbors))
 		return;
 
@@ -402,7 +414,7 @@ emit_csg(DPHypContext *context, HyperNode *node)
 	int i;
 
 	excluded = bmw_union(node->nodes, bmw_all_bit_set(node->representative));
-	neighbors = get_neighbors(node, excluded);
+	neighbors = get_neighbors(context, node, excluded);
 	if (bmw_is_empty(neighbors))
 		return;
 
@@ -410,22 +422,26 @@ emit_csg(DPHypContext *context, HyperNode *node)
 	while ((i = bmw_prev_member(neighbors, i)) >= 0)
 	{
 		HyperNode *complement;
+		bitmapword excluded_ext;
 
-		/*
-		 * Here in original paper we create set with single element.
-		 * Then during edges iteration we find edge right node of which is 'subset' of set created above.
-		 * But the only possible option - right node is the same set, because subset of single set - it is same same set.
-		 */
 		complement = (HyperNode *) list_nth(context->base_hypernodes, i);
-
-		if (hypernode_has_direct_edge_with(node, i))
+		
+		/*
+		 * Here in original paper we create S = {v} and then check that
+		 * edge rhs is subset of S.  But as you can see subset of single element
+		 * set is that set itself, so we can make optimized searching
+		 * for such edge.
+		 */
+		if (hypernode_has_direct_edge_with(context, node, i))
 			emit_csg_cmp(context, node, complement);
 
 		/*
-		 * We are iterating backwards, so we have to excluded all neighbors that are going to be visited.
-		 * Otherwise, we will get duplicates and execution time will skyrocket.
+		 * We are iterating backwards on neighbors, so we have to exclude
+		 * all nodes lower current, otherwise, we will get duplicates
+		 * and execution time will skyrocket.
 		 */
-		enumerate_cmp_recursive(context, node, complement, bmw_union(excluded, bmw_all_bit_set(i)));
+		excluded_ext = bmw_union(excluded, bmw_all_bit_set(i));
+		enumerate_cmp_recursive(context, node, complement, excluded_ext);
 	}
 }
 
@@ -437,7 +453,7 @@ enumerate_csg_recursive(DPHypContext *context, HyperNode *node, bitmapword exclu
 	bitmapword neighbors;
 	bitmapword excluded_ext;
 
-	neighbors = get_neighbors(node, excluded);
+	neighbors = get_neighbors(context, node, excluded);
 	if (bmw_is_empty(neighbors))
 		return;
 
@@ -470,7 +486,10 @@ solve(DPHypContext *context)
 {
 	int base_hypernodes_count = list_length(context->base_hypernodes);
 
-	/* For initial nodes we must iterate backwards to prevent exploring duplicates */
+	/* 
+	 * For initial nodes we must iterate backwards to 
+	 * prevent exploring duplicates
+	 */
 	for (int i = base_hypernodes_count - 1; i >= 0; i--)
 	{
 		HyperNode *node = (HyperNode *) list_nth(context->base_hypernodes, i);
@@ -478,8 +497,8 @@ solve(DPHypContext *context)
 		enumerate_csg_recursive(context, node, bmw_all_bit_set(i));
 
 		/*
-		 * When amount of relation is high, execution time will grow exponentially and user may request cancellation.
-		 * This seems a good place to check this.
+		 * Add this in case planning will take too long and user
+		 * request cancellation.
 		 */
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -512,185 +531,20 @@ map_to_internal_bms(List *initial_rels, Bitmapset *original)
 }
 
 static HyperNode *
-create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, int id, List *initial_rels)
+create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel, int id,
+						 DPHypContext *context)
 {
 	HyperNode *node;
-	List *edges;
-	ListCell *lc;
 
 	node = (HyperNode *)palloc(sizeof(HyperNode));
 
-	edges = NIL;
-
-	foreach(lc, rel->joininfo)
-	{
-		RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
-		ListCell *lc2;
-		bool can_add;
-		List *edge = NIL;
-
-		/*
-		 * Such check for binary operator is presented in 'make_restrictinfo_internal'
-		 */
-		if (!bms_is_empty(rinfo->left_relids) &&
-			!bms_is_empty(rinfo->right_relids) &&
-			!bms_overlap(rinfo->left_relids, rinfo->right_relids))
-		{
-			/* Create usual edge with 2 relations on both sides */
-			bitmapword left_bmw;
-			bitmapword right_bmw;
-
-			left_bmw = map_to_internal_bms(initial_rels, rinfo->left_relids);
-			if (bmw_is_empty(left_bmw))
-				continue;
-			right_bmw = map_to_internal_bms(initial_rels, rinfo->right_relids);
-			if (bmw_is_empty(right_bmw))
-				continue;
-
-			/* For convenience, we will sort vertices based on their representative */
-			if (left_bmw < right_bmw)
-				edge = list_make2((void *)left_bmw, (void *)right_bmw);
-			else
-				edge = list_make2((void *)right_bmw, (void *)left_bmw);
-		}
-		else
-		{
-			/* This is Cross Join Set with single vertex */
-			bitmapword bms;
-			bms = map_to_internal_bms(initial_rels, rinfo->required_relids);
-			if (!bmw_is_empty(bms))
-				edge = list_make1((void *)bms);
-		}
-
-		if (!edge)
-			continue;
-
-		/*
-		 * Verify, that there are no duplicates of edges we are going to add.
-		 * This can be true in cases when there are multiple join clauses on same set of relations.
-		 * For algorithm purposes, we only need to have one copy of such edge.
-		 */
-		can_add = true;
-		foreach (lc2, edges)
-		{
-			List *existing_edge = (List *)lfirst(lc2);
-			if (list_length(existing_edge) != list_length(edge))
-				continue;
-
-			if (list_length(existing_edge) == 1)
-			{
-				bitmapword existing_vertex = (bitmapword)linitial(existing_edge);
-				if (existing_vertex == (bitmapword)linitial(edge))
-				{
-					can_add = false;
-					break;
-				}
-			}
-			else
-			{
-				bitmapword left_existing = (bitmapword)linitial(existing_edge);
-				bitmapword right_existing = (bitmapword)llast(existing_edge);
-				bitmapword left_new = (bitmapword)linitial(edge);
-				bitmapword right_new = (bitmapword)llast(edge);
-
-				Assert(list_length(existing_edge) == 2);
-
-				/*
-				 * Vertices are sorted, so there is only single check is required.
-				 */
-				if (left_existing == left_new && right_existing == right_new)
-				{
-					can_add = false;
-					break;
-				}
-			}
-		}
-
-		if (can_add)
-			edges = lappend(edges, edge);
-	}
-
-	/*
-	 * PostgreSQL has equivalence classes mechanism that also used for join clauses.
-	 * For such cases we can not create conventional edges (1 or 2 vertices) - amount of them will grow exponentially.
-	 * So, we extend our hyperedges that way it can contain any amount of vertices.
-	 * Each vertex in such hyperedge can be processed same way as regular vertex.
-	 */
-	if (rel->has_eclass_joins)
-	{
-		int i = -1;
-		while ((i = bms_next_member(rel->eclass_indexes, i)) >= 0)
-		{
-			EquivalenceClass *ec = (EquivalenceClass *)list_nth(root->eq_classes, i);
-			List *edge;
-
-			/* Process only EC containing possible JOIN clauses */
-			if (bms_equal(ec->ec_relids, rel->relids))
-				continue;
-
-			edge = NIL;
-			foreach(lc, ec->ec_members)
-			{
-				EquivalenceMember *em = (EquivalenceMember *)lfirst(lc);
-				bitmapword bmw;
-
-				if (em->em_is_const)
-					continue;
-
-				Assert(!bms_is_empty(em->em_relids));
-				bmw = map_to_internal_bms(initial_rels, em->em_relids);
-				if (!bmw_is_empty(bmw))
-					edge = lappend(edge, (void *)bmw);
-			}
-
-			if (edge != NIL)
-				edges = lappend(edges, edge);
-		}
-	}
-
-	/* 
-	 * OUTER JOINs impose restrictions for join order. Notably, even if
-	 * we have some join clause 'a.x = b.x' this does not mean we have to
-	 * join only 'a' and 'b', because this can be RIGHT JOIN clause and
-	 * then we must join 'b' with 'a' + all relations on left part.
-	 * So, all SpecialJoinInfo create hyperedge.
-	 */
-	foreach (lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *)lfirst(lc);
-		bitmapword left_bmw;
-		bitmapword right_bmw;
-		if (sjinfo->jointype == JOIN_INNER)
-			continue;
-		
-		if (!(bms_is_subset(rel->relids, sjinfo->min_lefthand) ||
-			  bms_is_subset(rel->relids, sjinfo->min_righthand)))
-			continue;
-		
-		left_bmw = map_to_internal_bms(initial_rels, sjinfo->min_lefthand);
-		if (bmw_is_empty(left_bmw))
-			continue;
-		right_bmw = map_to_internal_bms(initial_rels, sjinfo->min_righthand);
-		if (bmw_is_empty(right_bmw))
-			continue;
-		edges = lappend(edges, list_make2((void *)left_bmw, (void *)right_bmw));
-	}
-
-	node->hyperedges = edges;
 	node->rel = rel;
 	node->candidates = NIL;
 	node->representative = id;
 	node->nodes = bmw_make_singleton(id);
+	node->simple_edges = context->simple_edges[id];
 
 	return node;
-}
-
-static int
-bmw_list_comparator(const ListCell *a, const ListCell *b)
-{
-	bitmapword a_nodes = (bitmapword)lfirst(a);
-	bitmapword b_nodes = (bitmapword)lfirst(b);
-	return a_nodes - b_nodes;
 }
 
 static HyperNode *
@@ -704,157 +558,20 @@ get_hypernode(DPHypContext *context, bitmapword nodes)
 
 	if (!found)
 	{
-		List *hyperedges;
-		int id;
+		int idx;
 
 		node->nodes = nodes;
 		node->representative = bmw_first(nodes);
 		node->rel = NULL;
 		node->candidates = NIL;
-
-		hyperedges = NIL;
-
-		/*
-		 * If this hypernode created for the first time, we must initialize it's hyperedges.
-		 * This is done by merging all hyperedges from base hypernodes it contains.
-		 * When iterating over hyperedges we skip all hypernodes that fully enclosed in current hypernode.
-		 *
-		 * There are some optimizations for merging base hyperedges.
-		 *
-		 * 1. We also try to eliminate all duplicates, otherwise the same edge will be created for every base hypernode it mentions.
-		 * This is done by sorting all hypernodes in hyperedges and then comparing newly created edge with all added ones.
-		 *
-		 * 2. All different vertexes fully enclosed in newly created hypernode will be merged into single vertex.
-		 * This helps us to reduce vertexes count and thus improve performance.
-		 * Note, that this is helpful primarily for EC hyperedges.
-		 */
-		id = -1;
-		while ((id = bmw_next_member(nodes, id)) >= 0)
+		
+		node->simple_edges = 0;
+		idx = -1;
+		while ((idx = bmw_next_member(nodes, idx)) >= 0)
 		{
-			HyperNode *base_node = list_nth(context->base_hypernodes, id);
-			ListCell *lc;
-
-			foreach (lc, base_node->hyperedges)
-			{
-				List *edge = (List *)lfirst(lc);
-				ListCell *lc2;
-				List *new_edge = NIL;
-				bitmapword all_my_vertexes = 0;
-				bitmapword all_vertexes = 0;
-				bool can_add;
-
-				foreach(lc2, edge)
-				{
-					bitmapword vertex = (bitmapword)lfirst(lc2);
-
-					all_vertexes = bmw_union(all_vertexes, vertex);
-
-					if (bmw_is_subset(vertex, nodes))
-						all_my_vertexes = bmw_union(all_my_vertexes, vertex);
-					else
-						new_edge = lappend(new_edge, (void *) vertex);
-				}
-
-				/*
-				 * Skip edge that fully enclosed in current hypernode.
-				 * It is not useful for further processing, because no neighbors will be detected from it.
-				 */
-				if (bmw_is_subset(all_vertexes, nodes))
-				{
-					list_free(new_edge);
-					continue;
-				}
-
-				if (new_edge == NIL)
-					continue;
-
-				/*
-				 * Merge all vertexes that belongs to new hypernode into single vertex.
-				 */
-				if (!bmw_is_empty(all_my_vertexes))
-					new_edge = lappend(new_edge, (void *) all_my_vertexes);
-
-				/*
-				 * Sort vertexes to further detect duplicates.
-				 */
-				if (1 < list_length(new_edge))
-				{
-					/* Ради частного случая в 2 вершины не стоит запускать list_sort */
-					if (list_length(new_edge) == 2)
-					{
-						bitmapword first_vertex = (bitmapword)linitial(new_edge);
-						bitmapword second_vertex = (bitmapword)llast(new_edge);
-						if (second_vertex < first_vertex)
-						{
-							linitial(new_edge) = (void *) second_vertex;
-							llast(new_edge) = (void *) first_vertex;
-						}
-					}
-					else
-					{
-						list_sort(new_edge, bmw_list_comparator);
-					}
-				}
-
-				can_add = true;
-				foreach(lc2, hyperedges)
-				{
-					List *other_edge = (List *)lfirst(lc2);
-					bool are_equal;
-
-					/* Edges with different vertexes count definitely are not equal */
-					if (list_length(new_edge) != list_length(other_edge))
-						continue;
-
-					/* For performance reasons split cases 1, 2 or multiple vertexes */
-					are_equal = true;
-					if (list_length(new_edge) == 1)
-					{
-						bitmapword v1 = (bitmapword)linitial(new_edge);
-						bitmapword v2 = (bitmapword)linitial(other_edge);
-						if (v1 != v2)
-							are_equal = false;
-					}
-					else if (list_length(new_edge) == 2)
-					{
-						bitmapword first_vertex = (bitmapword)linitial(new_edge);
-						bitmapword second_vertex = (bitmapword)llast(new_edge);
-						bitmapword other_first_vertex = (bitmapword)linitial(other_edge);
-						bitmapword other_second_vertex = (bitmapword)llast(other_edge);
-						if (first_vertex != other_first_vertex || second_vertex != other_second_vertex)
-							are_equal = false;
-					}
-					else
-					{
-						/* Generic case - compare each vertex iteratively */
-						ListCell *lc3;
-						ListCell *lc4;
-						forboth(lc3, new_edge, lc4, other_edge)
-						{
-							bitmapword first_vertex = (bitmapword)lfirst(lc3);
-							bitmapword second_vertex = (bitmapword)lfirst(lc4);
-							if (first_vertex != second_vertex)
-							{
-								are_equal = false;
-								break;
-							}
-						}
-
-					}
-
-					if (are_equal)
-					{
-						can_add = false;
-						break;
-					}
-				}
-
-				if (can_add)
-					hyperedges = lappend(hyperedges, new_edge);
-			}
+			node->simple_edges = bmw_union(node->simple_edges, context->simple_edges[idx]);
 		}
-
-		node->hyperedges = hyperedges;
+		node->simple_edges = bmw_difference(node->simple_edges, node->nodes);
 	}
 
 	return node;
@@ -949,12 +666,288 @@ create_dptable(List *base_hypernodes)
 
 		entry->rel = node->rel;
 		entry->candidates = node->candidates;
-		entry->hyperedges = node->hyperedges;
+		entry->simple_edges = node->simple_edges;
 		entry->representative = node->representative;
 		entry->nodes = node->nodes;
 	}
 
 	return dptable;
+}
+
+static void
+hyperedge_array_add(EdgeArray *array, HyperEdge edge)
+{
+	int low;
+	int high;
+	int mid;
+
+	if (array->size == 0)
+	{
+		/* If array is empty just do allocation and insert edge */
+		array->capacity = 16;
+		array->size = 1;
+		array->edges = palloc(sizeof(HyperEdge) * array->capacity);
+		array->edges[0] = edge;
+		return;
+	}
+
+	/* Use binary search to quickly find insert position */
+	low = 0;
+	high = array->size;
+	while (low < high)
+	{
+		int cmp;
+		mid = low + ((high - low) / 2);
+
+		cmp = hyperedge_cmp(edge, array->edges[mid]);
+		if (cmp == 0)
+			return;
+
+		if (cmp < 0)
+			high = mid;
+		else
+			low = mid + 1;
+	}
+
+	if (hyperedge_cmp(edge, array->edges[low]) == 0)
+		return;
+
+	/* Suitable position found - adjust edges and insert */
+	if (array->size == array->capacity)
+	{
+		array->capacity *= 2;
+		array->edges = repalloc(array->edges, sizeof(HyperEdge) * array->capacity);
+	}
+
+	Assert(low <= array->size);
+	if (low == array->size)
+	{
+		array->edges[array->size] = edge;
+	}
+	else
+	{
+		memmove(&array->edges[array->size], &array->edges[array->size + 1],
+				sizeof(HyperEdge) * (array->size - low));
+		array->edges[low] = edge;
+	}
+
+	array->size++;
+}
+
+static HyperEdge
+hyperedge_swap(HyperEdge edge)
+{
+	HyperEdge new_edge;
+	new_edge.left = edge.right;
+	new_edge.right = edge.left;
+	return new_edge;
+}
+
+static void
+distribute_hyperedge(DPHypContext *context, HyperEdge edge)
+{
+	Assert(hyperedge_is_valid(edge));
+
+	if (hyperedge_is_simple(edge))
+	{
+		int left_idx = bmw_next_member(edge.left, -1);
+		int right_idx = bmw_next_member(edge.right, -1);
+		bitmapword left_bmw;
+		bitmapword right_bmw;
+
+
+		Assert(left_idx >= 0 && right_idx >= 0);
+
+		left_bmw = context->simple_edges[left_idx];
+		right_bmw = context->simple_edges[right_idx];
+		context->simple_edges[left_idx] = bmw_add_member(left_bmw, right_idx);
+		context->simple_edges[right_idx] = bmw_add_member(right_bmw, left_idx);
+	}
+	else
+	{
+		int idx;
+
+		idx = -1;
+		while ((idx = bmw_next_member(edge.left, idx)) >= 0)
+		{
+			EdgeArray *array = &context->complex_edges[idx];
+			hyperedge_array_add(array, edge);
+		}
+		
+		idx = -1;
+		edge = hyperedge_swap(edge);
+		while ((idx = bmw_next_member(edge.left, idx)) >= 0)
+		{
+			EdgeArray *array = &context->complex_edges[idx];
+			hyperedge_array_add(array, edge);
+		}
+	}
+}
+
+static void
+distribute_cjs(DPHypContext *context, bitmapword cjs)
+{
+	HyperEdge edge;
+	int idx1;
+	int idx2;
+
+	if (bmw_is_empty(cjs) || bmw_is_singleton(cjs))
+		return;
+	
+	idx1 = -1;
+	while ((idx1 = bmw_next_member(cjs, idx1)) >= 0)
+	{
+		edge.left = bmw_make_singleton(idx1);
+		idx2 = idx1;
+
+		while ((idx2 = bmw_next_member(cjs, idx2)) >= 0)
+		{
+			edge.right = bmw_make_singleton(idx2);
+			distribute_hyperedge(context, edge);
+		}
+	}
+}
+
+static void
+initialize_edges(PlannerInfo *root, List *initial_rels, DPHypContext *context)
+{
+	ListCell *lc1;
+	ListCell *lc2;
+	bool has_eclass_joins;
+
+	context->edges_size = list_length(initial_rels);
+	context->simple_edges = palloc0(sizeof(bitmapword) * list_length(initial_rels));
+	context->complex_edges = palloc0(sizeof(EdgeArray) * list_length(initial_rels));
+
+	has_eclass_joins = false;
+	foreach(lc1, initial_rels)
+	{
+		RelOptInfo *rel = (RelOptInfo *)lfirst(lc1);
+
+		if (rel->has_eclass_joins)
+			has_eclass_joins = true;
+
+		foreach(lc2, rel->joininfo)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc2);
+
+			if (!bms_is_empty(rinfo->left_relids) &&
+				!bms_is_empty(rinfo->right_relids) &&
+				!bms_overlap(rinfo->left_relids, rinfo->right_relids))
+			{
+				/* 
+				 * For binary 
+				 */
+				HyperEdge edge;
+				
+				edge.left = map_to_internal_bms(initial_rels, rinfo->left_relids);
+				if (bmw_is_empty(edge.left))
+					continue;
+				edge.right = map_to_internal_bms(initial_rels, rinfo->right_relids);
+				if (bmw_is_empty(edge.right))
+					continue;
+
+				distribute_hyperedge(context, edge);
+			}
+			else
+			{
+				/* 
+				 * For CJS we must generate all pairs of simple hypernodes
+				 */
+				bitmapword required_nodes = map_to_internal_bms(initial_rels, rinfo->required_relids);
+
+				if (bmw_is_empty(required_nodes) || bmw_is_singleton(required_nodes))
+					continue;
+				
+				distribute_cjs(context, required_nodes);
+			}
+		}
+	}
+
+	if (has_eclass_joins)
+	{
+		/* 
+		 * Now, we must traverse through all eclasses that can be used as join
+		 * clauses and generate edges for them
+		 */
+		foreach(lc1, root->eq_classes)
+		{
+			EquivalenceClass *eclass = (EquivalenceClass *)lfirst(lc1);
+			bitmapword *eclass_nodes;
+			int eclass_nodes_size;
+
+			/* There are definitely no join clauses */
+			if (bms_membership(eclass->ec_relids) != BMS_MULTIPLE)
+				continue;
+
+			eclass_nodes = palloc0(sizeof(bitmapword) * list_length(eclass->ec_members));
+			eclass_nodes_size = 0;
+
+			foreach(lc2, eclass->ec_members)
+			{
+				EquivalenceMember *member = (EquivalenceMember *)lfirst(lc2);
+				
+				if (member->em_is_const || bms_is_empty(member->em_relids))
+					continue;
+				
+				eclass_nodes[eclass_nodes_size] = map_to_internal_bms(initial_rels, member->em_relids);
+				if (bmw_is_empty(eclass_nodes[eclass_nodes_size]))
+					continue;
+				eclass_nodes_size++;
+			}
+
+			if (eclass_nodes_size == 0)
+			{
+				pfree(eclass_nodes);
+				continue;
+			}
+
+			for (int i = 0; i < eclass_nodes_size; i++)
+			{
+				bitmapword left = eclass_nodes[i];
+
+				if (!bmw_is_singleton(left))
+					distribute_cjs(context, eclass_nodes[i]);
+
+				for (int j = i + 1; j < eclass_nodes_size; j++)
+				{
+					bitmapword right = eclass_nodes[j];
+
+					if (bmw_overlap(left, right))
+					{
+						distribute_cjs(context, bmw_union(left, right));
+					}
+					else
+					{
+						HyperEdge edge;
+						edge.left = left;
+						edge.right = right;
+						distribute_hyperedge(context, edge);
+					}
+				}
+			}
+
+			pfree(eclass_nodes);
+		}
+	}
+
+	/* 
+	 * Join order restrictions also impose restrictions on join order
+	 */
+	foreach(lc1, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *)lfirst(lc1);
+		HyperEdge edge;
+
+		edge.left = map_to_internal_bms(initial_rels, sjinfo->min_lefthand);
+		if (bmw_is_empty(edge.left))
+			continue;
+		edge.right = map_to_internal_bms(initial_rels, sjinfo->min_righthand);
+		if (bmw_is_empty(edge.right))
+			continue;
+
+		distribute_hyperedge(context, edge);
+	}
 }
 
 static RelOptInfo *
@@ -968,28 +961,22 @@ dphyp(PlannerInfo *root, List *initial_rels)
 	int id;
 	bool result_found;
 
+	initialize_edges(root, initial_rels, &context);
+
 	base_hypernodes = NIL;
 	id = 0;
 	foreach(lc, initial_rels)
 	{
-		/* 
-		 * TODO: create hyperedges and distributes them among hypernodes
-		 * 		 instead of creating their own copy for each hypernode.
-		 */
 		RelOptInfo *rel = (RelOptInfo *)lfirst(lc);
 		HyperNode *node;
 
-		node = create_initial_hypernode(root, rel, id, initial_rels);
+		node = create_initial_hypernode(root, rel, id, &context);
 		base_hypernodes = lappend(base_hypernodes, node);
 		++id;
 	}
 
 	dptable = create_dptable(base_hypernodes);
 
-	/*
-	 * Access paths for all rels in 'initial_rels' already found.
-	 * Ready to run DPHyp.
-	 */
 	context.dptable = dptable;
 	context.initial_rels = initial_rels;
 	context.root = root;
@@ -1028,8 +1015,7 @@ dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	 */
 	saved_join_rel_list = list_copy(root->join_rel_list);
 
-	rel = dphyp(root, initial_rels);	
-
+	rel = dphyp(root, initial_rels);
 	
 	/* Successfully found join order */
 	if (rel)

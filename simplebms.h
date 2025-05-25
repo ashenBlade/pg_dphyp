@@ -69,7 +69,7 @@ bmw_difference(bitmapword a, bitmapword b)
 static inline bool
 bmw_is_subset(bitmapword a, bitmapword b)
 {
-	return (a | b) == b;
+	return (a & b) == a;
 }
 
 /* 
@@ -209,6 +209,17 @@ bmw_single_element(bitmapword bmw, int x)
 	ValidateBmwPosition(x);
 	return bmw == MAKE_BMW(x);
 }
+
+/* 
+ * Check that 'bmw' has only single bit set.
+ * Does not check that 'bmw' is empty.
+ */
+static inline bool
+bmw_is_singleton(bitmapword bmw)
+{
+	return (bmw & (bmw - 1)) == 0;
+}
+
 
 /* 
  * Check if 'bmw' is empty
