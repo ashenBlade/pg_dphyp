@@ -21,6 +21,12 @@ static join_search_hook_type prev_join_search_hook = NULL;
 static bool dphyp_enabled = true;
 /* Do not apply DPhyp if SJ found (LEFT/RIGHT/OUTER etc...) */
 static bool dphyp_skip_sj = false;
+/* 
+ * When DPhyp failed to build query plan try to detect that 
+ * there are CROSS JOINs in query and try to pass all
+ * already build RelOptInfos for disjoint sets to DPsize
+ */
+static bool dphyp_detect_cj = true;
 
 void _PG_init(void);
 void _PG_fini(void);
@@ -176,7 +182,7 @@ static void emit_csg(DPHypContext *context, HyperNode *node);
 static void enumerate_csg_recursive(DPHypContext *context, HyperNode *node,
 									bitmapword excluded);
 static void solve(DPHypContext *context);
-static RelOptInfo *dphyp(PlannerInfo *root, List *initial_rels);
+static RelOptInfo *dphyp(DPHypContext *context, PlannerInfo *root, List *initial_rels);
 static RelOptInfo *hypernode_get_rel(DPHypContext *context, HyperNode *node);
 static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed,
 									 List *initial_rels);
@@ -674,6 +680,123 @@ create_dptable(List *base_hypernodes)
 	return dptable;
 }
 
+typedef struct us_state
+{
+	int *leaders;
+	int *ranks;
+	int size;
+} us_state;
+
+static void
+us_init(us_state *state, int size)
+{
+	int *leaders;
+	int *ranks;
+
+	leaders = palloc(sizeof(int) * size);
+	for (size_t i = 0; i < size; i++)
+	{
+		leaders[i] = i;
+	}
+	ranks = palloc0(sizeof(int) * size)	;
+
+	state->leaders = leaders;
+	state->ranks = ranks;
+	state->size = size;
+}
+
+static int
+us_leader(us_state *state, int node)
+{
+	Assert(node < state->size);
+	if (state->leaders[node] == node)
+		return node;
+	else
+		return state->leaders[node] = us_leader(state, state->leaders[node]);
+}
+
+static void
+us_union(us_state *state, int a, int b)
+{
+	int a_leader;
+	int b_leader;
+
+	a_leader = us_leader(state, a);
+	b_leader = us_leader(state, b);
+
+	if (state->ranks[a_leader] == state->ranks[b_leader])
+		state->ranks[a_leader]++;
+	
+	if (state->ranks[a_leader] < state->ranks[b_leader])
+		state->leaders[a_leader] = b_leader;
+	else
+		state->leaders[b_leader] = a_leader;
+}
+
+static bool us_all_connected(us_state *state)
+{
+	int prev_leader = -1;
+	for (size_t i = 0; i < state->size; i++)
+	{
+		int leader = us_leader(state, i);
+		if (prev_leader == -1)
+		{
+			prev_leader = leader;
+		}
+		else if (prev_leader != leader)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static bitmapword *
+us_collect(us_state *state, int *size)
+{
+	bitmapword *disjoint_sets;
+	bitmapword *result;
+	int result_size;
+	int idx;
+
+	disjoint_sets = palloc0(sizeof(bitmapword) * state->size);
+	result_size = 0;
+	for (size_t i = 0; i < state->size; i++)
+	{
+		int leader = us_leader(state, i);
+		if (bmw_is_empty(disjoint_sets[leader]))
+		{
+			disjoint_sets[leader] = bmw_make_singleton(i);
+			result_size++;
+		}
+		else
+			disjoint_sets[leader] = bmw_add_member(disjoint_sets[leader], i);
+	}
+
+	result = palloc(sizeof(bitmapword) * result_size);
+	idx = 0;
+	for (size_t i = 0; i < state->size; i++)
+	{
+		if (bmw_is_empty(disjoint_sets[i]))
+			continue;
+		
+		result[idx] = disjoint_sets[i];
+		idx++;
+	}
+	
+	pfree(disjoint_sets);
+	*size = result_size;
+	return result;
+}
+
+static void
+us_free(us_state *state)
+{
+	pfree(state->leaders);
+	pfree(state->ranks);
+}
+
 static void
 hyperedge_array_add(EdgeArray *array, HyperEdge edge)
 {
@@ -806,6 +929,106 @@ distribute_cjs(DPHypContext *context, bitmapword cjs)
 			distribute_hyperedge(context, edge);
 		}
 	}
+}
+
+static List *
+collect_disjoint_rels(DPHypContext *context)
+{
+	us_state state;
+	bitmapword *disjoint_sets;
+	int disjoint_sets_size;
+	List *result;
+
+	us_init(&state, context->edges_size);
+	for (int i = 0; i < context->edges_size; ++i)
+	{
+		bitmapword simple_edge = context->simple_edges[i];
+		int idx;
+
+		idx = -1;
+		while ((idx = bmw_next_member(simple_edge, idx)) >= 0)
+		{
+			us_union(&state, i, idx);
+		}
+	}
+
+	if (us_all_connected(&state))
+	{
+		us_free(&state);
+		return NIL;
+	}
+
+	/* 
+	 * Disjoint sets exist and be have to generate hyperedges 
+	 * covering all such disjoint sets.  So process complex edges,
+	 * collect disjoint sets and generate hyperedges.
+	 */
+	for (int i = 0; i < context->edges_size; ++i)
+	{
+		EdgeArray *edges = &context->complex_edges[i];
+		
+		for (int j = 0; j < edges->size; ++j)
+		{
+			HyperEdge edge = edges->edges[j];
+			List *left_vertices;
+			int idx;
+
+			idx = -1;
+			left_vertices = NIL;
+			while ((idx = bmw_next_member(edge.left, idx)) >= 0)
+			{
+				left_vertices = lappend_int(left_vertices, idx);
+			}
+
+			idx = -1;
+			while ((idx = bmw_next_member(edge.right, idx)) >= 0)
+			{
+				ListCell *lc;
+				foreach(lc, left_vertices)
+				{
+					int left_vertex = lfirst_int(lc);
+					us_union(&state, left_vertex, idx);
+				}
+			}
+		}
+	}
+
+	disjoint_sets = us_collect(&state, &disjoint_sets_size);
+	if (disjoint_sets_size <= 1)
+	{
+		us_free(&state);
+		return NIL;
+	}
+
+	result = NIL;
+	for (int i = 0; i < disjoint_sets_size; ++i)
+	{
+		bitmapword set = disjoint_sets[i];
+		RelOptInfo *rel;
+		HyperNode *node;
+
+		node = hash_search(context->dptable, &set, HASH_FIND, NULL);
+		if (!(node && hypernode_has_rel(node)))
+		{
+			list_free(result);
+			result = NIL;
+			break;
+		}
+
+		rel = hypernode_get_rel(context, node);
+		if (!rel)
+		{
+			list_free(result);
+			result = NIL;
+			break;
+		}
+
+		result = lappend(result, rel);
+	}
+
+	pfree(disjoint_sets);
+	us_free(&state);
+	return result;
 }
 
 static void
@@ -951,17 +1174,16 @@ initialize_edges(PlannerInfo *root, List *initial_rels, DPHypContext *context)
 }
 
 static RelOptInfo *
-dphyp(PlannerInfo *root, List *initial_rels)
+dphyp(DPHypContext *context, PlannerInfo *root, List *initial_rels)
 {
 	HTAB *dptable;
 	HyperNode *result;
-	DPHypContext context;
 	List *base_hypernodes;
 	ListCell *lc;
 	int id;
 	bool result_found;
 
-	initialize_edges(root, initial_rels, &context);
+	initialize_edges(root, initial_rels, context);
 
 	base_hypernodes = NIL;
 	id = 0;
@@ -970,25 +1192,25 @@ dphyp(PlannerInfo *root, List *initial_rels)
 		RelOptInfo *rel = (RelOptInfo *)lfirst(lc);
 		HyperNode *node;
 
-		node = create_initial_hypernode(root, rel, id, &context);
+		node = create_initial_hypernode(root, rel, id, context);
 		base_hypernodes = lappend(base_hypernodes, node);
 		++id;
 	}
 
 	dptable = create_dptable(base_hypernodes);
 
-	context.dptable = dptable;
-	context.initial_rels = initial_rels;
-	context.root = root;
-	context.base_hypernodes = base_hypernodes;
-	context.all_query_nodes = bmw_all_bit_set(list_length(initial_rels) - 1);
-	solve(&context);
+	context->dptable = dptable;
+	context->initial_rels = initial_rels;
+	context->root = root;
+	context->base_hypernodes = base_hypernodes;
+	context->all_query_nodes = bmw_all_bit_set(list_length(initial_rels) - 1);
+	solve(context);
 	
-	result = hash_search(dptable, &context.all_query_nodes, HASH_FIND, &result_found);
+	result = hash_search(dptable, &context->all_query_nodes, HASH_FIND, &result_found);
 	if (!(result && result->candidates))
 		return NULL;
 
-	return hypernode_get_rel(&context, result);
+	return hypernode_get_rel(context, result);
 }
 
 static RelOptInfo *
@@ -996,6 +1218,8 @@ dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
 	RelOptInfo *rel;
 	List *saved_join_rel_list;
+	DPHypContext context;
+	List *disjoint_rels;
 
 	if (!dphyp_enabled ||
 		BITS_PER_BITMAPWORD <= levels_needed ||
@@ -1015,7 +1239,7 @@ dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	 */
 	saved_join_rel_list = list_copy(root->join_rel_list);
 
-	rel = dphyp(root, initial_rels);
+	rel = dphyp(&context, root, initial_rels);
 	
 	/* Successfully found join order */
 	if (rel)
@@ -1024,9 +1248,18 @@ dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 		return rel;
 	}
 
-	/* Restore state before proceeding to DPsize/GEQO */
-	list_free(root->join_rel_list);
-	root->join_rel_list = saved_join_rel_list;
+	if ((dphyp_detect_cj && (disjoint_rels = collect_disjoint_rels(&context)) != NIL))
+	{
+		initial_rels = disjoint_rels;
+		levels_needed = list_length(disjoint_rels);
+	}
+	else
+	{
+		/* Restore state before proceeding to DPsize/GEQO */
+		list_free(root->join_rel_list);
+		root->join_rel_list = saved_join_rel_list;
+	}
+
 
 	/* Fallback to conventional DPsize/GEQO */
 	if (prev_join_search_hook)
@@ -1053,6 +1286,7 @@ _PG_init(void)
 							 dphyp_skip_sj,
 							 PGC_USERSET,
 							 0, NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("pg_dphyp");
 
 	prev_join_search_hook = join_search_hook;
