@@ -21,8 +21,6 @@ static join_search_hook_type prev_join_search_hook = NULL;
 static bool dphyp_enabled = true;
 /* Do not apply DPhyp if SJ found (LEFT/RIGHT/OUTER etc...) */
 static bool dphyp_skip_sj = false;
-/* Threshold for GEQO used by DPhyp */
-static int dphyp_geqo_threshold = 12;
 
 void _PG_init(void);
 void _PG_fini(void);
@@ -1069,14 +1067,6 @@ _PG_init(void)
 							 dphyp_skip_sj,
 							 PGC_USERSET,
 							 0, NULL, NULL, NULL);
-	DefineCustomIntVariable("pg_dphyp.geqo_threshold",
-							"Sets the threshold of FROM items beyond which DPhyp algorithm will not be used.",
-							NULL,
-							&dphyp_geqo_threshold,
-							dphyp_geqo_threshold,
-							2, BITS_PER_BITMAPWORD - 1,
-							PGC_USERSET,
-							0, NULL, NULL, NULL);
 	MarkGUCPrefixReserved("pg_dphyp");
 
 	prev_join_search_hook = join_search_hook;
