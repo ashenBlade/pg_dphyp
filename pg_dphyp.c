@@ -131,6 +131,9 @@ typedef struct DPHypContext
 	 */
 	List *base_hypernodes;
 
+	/* 
+	 * Size of 'simple_edges' and 'complex_edges' arrays
+	 */
 	int edges_size;
 
 	/* 
@@ -1286,6 +1289,15 @@ _PG_init(void)
 							 dphyp_skip_sj,
 							 PGC_USERSET,
 							 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_dphyp.detect_cj",
+							 "If DPhyp failed to create final plan then detect "
+							 "disjoint graphs created by join clauses and pass "
+							 "them to DPsize",
+							 NULL,
+							 &dphyp_detect_cj,
+							 dphyp_detect_cj,
+							 PGC_USERSET,
+					 		 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("pg_dphyp");
 
