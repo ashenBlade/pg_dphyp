@@ -9,10 +9,14 @@
 #include "utils/guc.h"
 #include "miscadmin.h"
 #include "limits.h"
+#include "funcapi.h"
 
 #include "simplebms.h"
 
 PG_MODULE_MAGIC;
+
+PG_FUNCTION_INFO_V1(pg_dphyp_get_statistics);
+PG_FUNCTION_INFO_V1(pg_dphyp_reset_statistics);
 
 static join_search_hook_type prev_join_search_hook = NULL;
 
@@ -192,6 +196,17 @@ typedef struct NeighborhoodCache
 	bitmapword sentinel;
 } NeighborhoodCache;
 
+/* Collected statistics during server work */
+typedef struct Statistics
+{
+	/* Total amount of DPhyp was executed */
+	uint64 total_runs;
+	/* Amount of attempts to perform join search */
+	uint64 failed_runs;
+} Statistics;
+
+static Statistics statistics = {0};
+
 static HTAB *create_dptable(List *base_hypernodes);
 static HyperNode *create_initial_hypernode(PlannerInfo *root, RelOptInfo *rel,
 										   int id, DPHypContext *context);
@@ -230,7 +245,7 @@ static void neighborhood_cache_end(NeighborhoodCache *cache, bitmapword subgroup
 /* 
  * Structure used as state for enumerating subsets of given bitmap
  */
-typedef struct
+typedef struct SubsetIteratorState
 {
 	/*
 	 * Current subset to return. 0 means no more subsets.
@@ -243,6 +258,30 @@ typedef struct
 } SubsetIteratorState;
 static void subset_iterator_init(SubsetIteratorState *state, bitmapword bmw);
 static bool subset_iterator_next(SubsetIteratorState *state, bitmapword *result);
+
+Datum
+pg_dphyp_get_statistics(PG_FUNCTION_ARGS)
+{
+	TupleDesc tupdesc;
+	Datum values[2] = {0};
+	bool nulls[2] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	
+	values[0] = Int64GetDatum(statistics.total_runs);
+	values[1] = Int64GetDatum(statistics.failed_runs);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+Datum
+pg_dphyp_reset_statistics(PG_FUNCTION_ARGS)
+{
+	statistics.failed_runs = 0;
+	statistics.total_runs = 0;
+	PG_RETURN_VOID();
+}
 
 /* 
  * Check that we calculated any query plan for this hypernode
@@ -1344,13 +1383,16 @@ dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	saved_join_rel_list = list_copy(root->join_rel_list);
 
 	rel = dphyp(&context, root, initial_rels);
-	
+	statistics.total_runs++;
+
 	/* Successfully found join order */
 	if (rel)
 	{
 		list_free(saved_join_rel_list);
 		return rel;
 	}
+
+	statistics.failed_runs++;
 
 	if ((dphyp_detect_cj && (disjoint_rels = collect_disjoint_rels(&context)) != NIL))
 	{

@@ -1,0 +1,14 @@
+CREATE FUNCTION pg_dphyp_get_statistics(
+    OUT total bigint,
+    OUT failed bigint
+)
+RETURNS record
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION pg_dphyp_reset_statistics()
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
+
