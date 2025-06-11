@@ -45,6 +45,13 @@ bmw_add_member(bitmapword bmw, int x)
 	return bmw | MAKE_BMW(x);
 }
 
+
+static inline bitmapword
+bmw_intersect(bitmapword a, bitmapword b)
+{
+	return a & b;
+}
+
 /* 
  * Union 2 bitmapwords into 1
  */
@@ -94,22 +101,24 @@ bmw_is_member(bitmapword bmw, int x)
 /* 
  * Check if 'a' and 'b' have any common members
  */
-static inline bitmapword
+static inline bool
 bmw_overlap(bitmapword a, bitmapword b)
 {
 	return (a & b) != 0;
 }
 
 /* 
- * Get first member of bitmapword from start
+ * Get index of first member of bitmapword from start.
+ * Used to get representative of hypernode.
  */
 static inline int
 bmw_first(bitmapword bmw)
 {
+	/* Do not use 'bmw_rightmost_one_pos' - overhead and 0 is not valid for it */
+	// return bmw & (-bmw);
 	if (bmw == 0)
-		return -1;
-	else
-		return bmw_rightmost_one_pos(bmw);
+		return 0;
+	return bmw_rightmost_one_pos(bmw);
 }
 
 /* 
