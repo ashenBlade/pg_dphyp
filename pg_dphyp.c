@@ -184,17 +184,31 @@ typedef struct Statistics
 	uint64 failed_runs;
 } Statistics;
 
+typedef enum CrossJoinStrategy
+{
+	CJ_STRATEGY_NO,
+	CJ_STRATEGY_DETECT,
+	CJ_STRATEGY_PASS,
+} CrossJoinStrategy;
+
+static const struct config_enum_entry cross_join_strategy_options[] =
+{
+	{ "no", CJ_STRATEGY_NO, false },
+	{ "detect", CJ_STRATEGY_DETECT, false },
+	{ "pass", CJ_STRATEGY_PASS, false },
+	{ NULL, 0, false },
+};
+
 /* GUC */
 /* Extension is enabled and should run DPhyp */
 static bool dphyp_enabled = true;
 /* Do not apply DPhyp if SJ found (LEFT/RIGHT/OUTER etc...) */
 static bool dphyp_skip_sj = false;
 /*
- * When DPhyp failed to build query plan try to detect that
- * there are CROSS JOINs in query and try to pass all
- * already build RelOptInfos for disjoint sets to DPsize
+ * In case of CROSS JOINs we can get disjoint subgraphs for tree, so let user
+ * decide how to handle them.
  */
-static bool dphyp_detect_cj = true;
+static int dphyp_cj_strategy = CJ_STRATEGY_PASS;
 
 static join_search_hook_type prev_join_search_hook = NULL;
 
@@ -1101,13 +1115,11 @@ distribute_cjs(DPHypContext *context, bitmapword cjs)
 	}
 }
 
-static List *
-collect_disjoint_rels(DPHypContext *context)
+static bitmapword *
+collect_disjoint_sets(DPHypContext *context, int *out_size)
 {
 	us_state state;
 	bitmapword *disjoint_sets;
-	int disjoint_sets_size;
-	List *result;
 
 	us_init(&state, context->edges_size);
 	for (int i = 0; i < context->edges_size; ++i)
@@ -1128,7 +1140,7 @@ collect_disjoint_rels(DPHypContext *context)
 	if (us_all_connected(&state))
 	{
 		us_free(&state);
-		return NIL;
+		return NULL;
 	}
 
 	/*
@@ -1166,15 +1178,29 @@ collect_disjoint_rels(DPHypContext *context)
 		}
 	}
 
-	disjoint_sets = us_collect(&state, &disjoint_sets_size);
+	disjoint_sets = us_collect(&state, out_size);
 	us_free(&state);
-	if (disjoint_sets_size <= 1)
+	if (*out_size <= 1)
 	{
 		/* All nodes are connected to each other */
 		if (disjoint_sets != NULL)
 			pfree(disjoint_sets);
-		return NIL;
+		return NULL;
 	}
+
+	return disjoint_sets;
+}
+
+static List *
+collect_disjoint_rels(DPHypContext *context)
+{
+	List *result;
+	int disjoint_sets_size;
+	bitmapword *disjoint_sets;
+
+	disjoint_sets = collect_disjoint_sets(context, &disjoint_sets_size);
+	if (disjoint_sets == NULL)
+		return NIL;
 
 	/* For each disjoint set collect it's RelOptInfo (build lazy) */
 	result = NIL;
@@ -1470,6 +1496,36 @@ initialize_edges(PlannerInfo *root, List *initial_rels, DPHypContext *context)
 		distribute_hyperedge(context, edge);
 	}
 
+	if (dphyp_cj_strategy == CJ_STRATEGY_DETECT)
+	{
+		/* Generate all possible pairs for each disjoint set */
+		bitmapword *disjoint_sets;
+		int disjoint_sets_size;
+
+		disjoint_sets = collect_disjoint_sets(context, &disjoint_sets_size);
+		if (disjoint_sets != NULL && 1 < disjoint_sets_size)
+		{
+			for (size_t i = 0; i < disjoint_sets_size - 1; i++)
+			{
+				bitmapword left = disjoint_sets[i];
+				distribute_cjs(context, left);
+				for (size_t j = i + 1; j < disjoint_sets_size; j++)
+				{
+					bitmapword right = disjoint_sets[j];
+					HyperEdge edge;
+
+					distribute_cjs(context, right);
+					edge.left = left;
+					edge.right = right;
+
+					distribute_hyperedge(context, edge);
+				}
+			}
+			
+			pfree(disjoint_sets);
+		}
+	}
+
 	compute_start_index(context);
 }
 
@@ -1551,7 +1607,7 @@ dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 
 	statistics.failed_runs++;
 
-	if ((dphyp_detect_cj && (disjoint_rels = collect_disjoint_rels(&context)) != NIL))
+	if ((dphyp_cj_strategy == CJ_STRATEGY_PASS && (disjoint_rels = collect_disjoint_rels(&context)) != NIL))
 	{
 		initial_rels = disjoint_rels;
 		levels_needed = list_length(disjoint_rels);
@@ -1588,13 +1644,13 @@ _PG_init(void)
 							 dphyp_skip_sj,
 							 PGC_USERSET,
 							 0, NULL, NULL, NULL);
-	DefineCustomBoolVariable("pg_dphyp.detect_cj",
-							 "If DPhyp failed to create final plan then detect "
-							 "disjoint graphs created by join clauses and pass "
-							 "them to DPsize",
+	DefineCustomEnumVariable("pg_dphyp.cj_strategy",
+							 "Specifies how extension handles disjoint relations "
+							 "that arise from CROSS JOINs",
 							 NULL,
-							 &dphyp_detect_cj,
-							 dphyp_detect_cj,
+							 &dphyp_cj_strategy,
+							 dphyp_cj_strategy,
+							 cross_join_strategy_options,
 							 PGC_USERSET,
 					 		 0, NULL, NULL, NULL);
 
