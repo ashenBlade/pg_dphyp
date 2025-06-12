@@ -114,11 +114,16 @@ bmw_overlap(bitmapword a, bitmapword b)
 static inline int
 bmw_first(bitmapword bmw)
 {
-	/* Do not use 'bmw_rightmost_one_pos' - overhead and 0 is not valid for it */
-	// return bmw & (-bmw);
 	if (bmw == 0)
 		return 0;
-	return bmw_rightmost_one_pos(bmw);
+	else
+		return bmw_rightmost_one_pos(bmw);
+}
+
+static inline int
+bmw_lowest_bit(bitmapword bmw)
+{
+	return bmw & (-bmw);
 }
 
 /* 

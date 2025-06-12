@@ -3753,19 +3753,21 @@ select * from
   tenk1 join int4_tbl on f1 = twothousand,
   q1, q2
 where thousand = (q1 + q2);
-                      QUERY PLAN                      
-------------------------------------------------------
- Nested Loop
-   Join Filter: (tenk1.thousand = (q1.q1 + q2.q2))
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Hash Join
+   Hash Cond: (tenk1.twothousand = int4_tbl.f1)
    ->  Nested Loop
-         ->  Seq Scan on q1
-         ->  Seq Scan on q2
-   ->  Hash Join
-         Hash Cond: (tenk1.twothousand = int4_tbl.f1)
-         ->  Seq Scan on tenk1
-         ->  Hash
-               ->  Seq Scan on int4_tbl
-(10 rows)
+         ->  Nested Loop
+               ->  Seq Scan on q1
+               ->  Seq Scan on q2
+         ->  Bitmap Heap Scan on tenk1
+               Recheck Cond: (thousand = (q1.q1 + q2.q2))
+               ->  Bitmap Index Scan on tenk1_thous_tenthous
+                     Index Cond: (thousand = (q1.q1 + q2.q2))
+   ->  Hash
+         ->  Seq Scan on int4_tbl
+(12 rows)
 
 --
 -- test ability to generate a suitable plan for a star-schema query
@@ -3805,6 +3807,8 @@ where t1.unique2 < 42 and t1.stringu1 > t2.stringu2;
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Nested Loop
+   ->  Seq Scan on int4_tbl i1
+         Filter: (f1 = 0)
    ->  Nested Loop
          Join Filter: (t1.stringu1 > t2.stringu2)
          ->  Nested Loop
@@ -3815,8 +3819,6 @@ where t1.unique2 < 42 and t1.stringu1 > t2.stringu2;
                            Index Cond: (unique1 = (3))
          ->  Index Scan using tenk1_unique2 on tenk1 t1
                Index Cond: ((unique2 = (11)) AND (unique2 < 42))
-   ->  Seq Scan on int4_tbl i1
-         Filter: (f1 = 0)
 (13 rows)
 
 select t1.unique2, t1.stringu1, t2.unique1, t2.stringu2 from

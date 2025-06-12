@@ -96,12 +96,16 @@ typedef struct EdgeArray
 	int size;
 	/* Array of hyperedges */
 	HyperEdge *edges;
+	/* Size of 'start_idx' array */
+	int start_idx_size;
+	/* Index storing positions from which to start iterating */
+	int8 *start_idx;
 } EdgeArray;
 
 static inline bool
 hyperedge_is_simple(HyperEdge edge)
 {
-	return !bmw_is_singleton(edge.left | edge.right);
+	return bmw_is_singleton(edge.left) && bmw_is_singleton(edge.right);
 }
 
 static inline bool
@@ -118,10 +122,17 @@ hyperedge_is_valid(HyperEdge edge)
 static inline int
 hyperedge_cmp(HyperEdge a, HyperEdge b)
 {
-	/* Simple integer tuple (left, right) comparison */
-	bitmapword t = a.left - b.left;
+	/* Simple integer tuple (lowest(right), left, right) comparison */
+	bitmapword t;
+
+	t = bmw_lowest_bit(a.right) - bmw_lowest_bit(b.right);
 	if (t != 0)
 		return t;
+
+	t = a.left - b.left;
+	if (t != 0)
+		return t;
+
 	t = a.right - b.right;
 	return t;
 }
@@ -241,6 +252,8 @@ static bitmapword neighborhood_cache_begin(NeighborhoodCache *cache, bitmapword 
 										   bitmapword *saved_neighborhood);
 static void neighborhood_cache_end(NeighborhoodCache *cache, bitmapword subgroup,
 								   bitmapword neighborhood);
+static void compute_start_index(DPHypContext *context);
+static int get_start_index(EdgeArray *edges, bitmapword bmw);
 
 /* 
  * Structure used as state for enumerating subsets of given bitmap
@@ -383,18 +396,17 @@ get_neighbors(DPHypContext *context, HyperNode *node, bitmapword excluded,
 	while ((idx = bmw_next_member(delta, idx)) >= 0)
 	{
 		EdgeArray *edges = &context->complex_edges[idx];
-		for (int i = 0; i < edges->size; i++)
+		int i = get_start_index(edges, neighbors | excluded);
+		for (; i < edges->size; i++)
 		{
 			HyperEdge edge = edges->edges[i];
 			if ( bmw_is_subset(edge.left, node->nodes) &&
-				!bmw_overlap(edge.right, neighbors | excluded | node->nodes))
+				!bmw_overlap(edge.right, neighbors | excluded))
 			{
-				neighbors |= bmw_first(edge.right);
+				neighbors |= bmw_lowest_bit(edge.right);
 			}
 		}
 	}
-
-	neighbors = bmw_difference(neighbors, excluded);
 
 	neighborhood_cache_end(cache, grown_by, neighbors);
 
@@ -454,7 +466,7 @@ hypernode_has_edge_with(DPHypContext *context, HyperNode *node, bitmapword bmw)
 	while ((idx = bmw_next_member(node->nodes, idx)) >= 0)
 	{
 		EdgeArray *edges = &context->complex_edges[idx];
-		
+
 		for (int i = 0; i < edges->size; i++)
 		{
 			HyperEdge edge = edges->edges[i];
@@ -1001,7 +1013,7 @@ hyperedge_array_add(EdgeArray *array, HyperEdge edge)
 	}
 	else
 	{
-		memmove(&array->edges[array->size], &array->edges[array->size + 1],
+		memmove(&array->edges[low + 1], &array->edges[low],
 				sizeof(HyperEdge) * (array->size - low));
 		array->edges[low] = edge;
 	}
@@ -1171,6 +1183,124 @@ collect_disjoint_rels(DPHypContext *context)
 	return result;
 }
 
+static int
+get_start_index(EdgeArray *edges, bitmapword excluded)
+{
+	int index;
+	int lowest_bit;
+
+	if (edges->start_idx_size == 0)
+		return edges->size;
+
+	/* 
+	 * 'start_idx' primarily used to effectively truncate edges that will not
+	 * satisfy 'bmw_overlaps' with 'excluded' set of nodes.
+	 * The main observation is that often we have all leading 1 in 'excluded',
+	 * so right vertex in any edge with first bit in that range definitely will
+	 * return 'false'.
+	 * To address this 'start_idx' is used. It is an array:
+	 * 
+	 * [number of leading 0] -> index in 'edges' array
+	 * 
+	 * 'edges' array is sorted by number of leading 0, so we can assert that
+	 * if we have 0010 then 0100 will also not overlap with 0001.
+	 *
+	 * To search suitable position we find first 0 bit after some leading 1.
+	 * This is done by inverse - add 1 to sequence of leading 1 and count
+	 * produced amount of 0. e.g.
+	 * 
+	 * 1001111 + 1 -> 1010000 (4 leading 1s == 4 leading 0s)
+	 */
+	Assert(excluded != ~((bitmapword)0));
+	lowest_bit = bmw_first(excluded + 1);
+
+	if (edges->start_idx_size <= lowest_bit)
+		return edges->size;
+
+	index = (int)edges->start_idx[lowest_bit];
+	Assert(0 <= index && index < BITS_PER_BITMAPWORD);
+	return index;
+}
+
+static void
+compute_start_index(DPHypContext *context)
+{
+	for (size_t i = 0; i < context->edges_size; i++)
+	{
+		EdgeArray *edges = &context->complex_edges[i];
+		char prev_idx;
+		int prev_lowest;
+
+		if (edges->size == 0)
+		{
+			edges->start_idx = NULL;
+			edges->start_idx_size = 0;
+			continue;
+		}
+
+		/* 
+		 * Array indexed by number of bits, so there 2 observations:
+		 *
+		 * 1. Maximum useful size of this index does not exceed largest
+		 *    number of leading bits, so we allocate that amount.
+		 *    Array is sorted, so just get size of last hyperedge.
+		 * 2. We should reserve special value for 0 number of set bits. This
+		 *    value always is 0 (have to traverse all array).
+		 */
+		edges->start_idx_size = bmw_first(edges->edges[edges->size - 1].right) + 1;
+		edges->start_idx = palloc(sizeof(int8) * edges->start_idx_size);
+
+		if (edges->size == 1)
+		{
+			/* 
+			 * In case of simple query there may be single complex edge.
+			 * You can observe, that this will be array of 0.
+			 */
+			memset(edges->start_idx, 0, sizeof(int8) * edges->start_idx_size);
+			continue;
+		}
+
+		/* Set -1 as indicator, that we do not have value set yet */
+		memset(edges->start_idx, -1, sizeof(int8) * edges->start_idx_size);
+
+		edges->start_idx[0] = 0;
+		prev_lowest = 0;
+
+		/* 
+		 * Proceed in 2 runs: 
+		 * 
+		 * 1. Iterate over all edges and for each possible leading zero bit
+		 *    count save position where it starts. Here we use knowledge,
+		 *    that hyperedges are sorted, so just track previous 'lowest'
+		 *    number and compare with current
+		 * 2. Iterate over 'start_index' array and fill missing indexes.
+		 *    If value is absent (-1), then set it to previous value (we
+		 *    iterate left->right).
+		 */
+
+		/* First run - set all possible values */
+		for (size_t j = 0; j < edges->size; j++)
+		{
+			int cur_lowest = bmw_first(edges->edges[j].right);
+			if (cur_lowest == prev_lowest)
+				continue;
+
+			prev_lowest = cur_lowest;
+			edges->start_idx[cur_lowest] = j;
+		}
+		
+		/* Second run - fill missing indexes */
+		prev_idx = 0;
+		for (size_t j = 0; j < edges->start_idx_size; j++)
+		{
+			if (edges->start_idx[j] == -1)
+				edges->start_idx[j] = prev_idx;
+			else
+				prev_idx = edges->start_idx[j];
+		}
+	}
+}
+
 static void
 initialize_edges(PlannerInfo *root, List *initial_rels, DPHypContext *context)
 {
@@ -1314,6 +1444,8 @@ initialize_edges(PlannerInfo *root, List *initial_rels, DPHypContext *context)
 		distribute_cjs(context, edge.right);
 		distribute_hyperedge(context, edge);
 	}
+
+	compute_start_index(context);
 }
 
 static RelOptInfo *
