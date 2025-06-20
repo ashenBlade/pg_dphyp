@@ -28,6 +28,7 @@ void _PG_fini(void);
  */
 typedef struct HyperNode
 {
+	/* TODO: rename to 'set' */
 	/*
 	 * Bitmap of relations this Hypernode represents.
 	 * Must be first field in structure - used as key.
@@ -141,30 +142,23 @@ typedef struct DPHypContext
 	bitmapword all_query_nodes;
 } DPHypContext;
 
-typedef struct NeighborhoodCache
-{
-	/*
-	 * Neighborhood for 'last_subgroup' found.
-	 */
-	bitmapword last_neighborhood;
-	/*
-	 * Last seen subgroup for which 'get_neighbors' was called
-	 */
-	bitmapword last_grow;
-	/*
-	 * Special bit used to indicate that we should not store
-	 * results for current 'get_neighbors'.  Such heuristic
-	 * should decrease amount of extra iterations over non
-	 * visited nodes in subgroup.
-	 */
-	bitmapword sentinel;
-} NeighborhoodCache;
-
 /*
  * Structure used as state for enumerating subsets of given bitmap
  */
 typedef struct SubsetIteratorState
 {
+	/* 
+	 * Saved neighborhood from previous run
+	 */
+	bitmapword saved_neighborhood;
+	/* 
+	 * Current iteration number is even
+	 */
+	bool is_even;
+	/*
+	 * Current subset value
+	 */
+	bitmapword subset;
 	/*
 	 * Current subset to return. 0 means no more subsets.
 	 */
@@ -225,9 +219,9 @@ static void distribute_hyperedge(DPHypContext *context, HyperEdge edge);
 static HyperEdge hyperedge_swap(HyperEdge edge);
 static void hyperedge_array_add(EdgeArray *array, HyperEdge edge);
 static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes);
-static bitmapword get_neighbors(DPHypContext *context, HyperNode *node,
-								bitmapword excluded, bitmapword grown_by,
-								NeighborhoodCache *cache);
+static bitmapword get_neighbors_iter(DPHypContext *context, bitmapword subgroup, bitmapword excluded,
+									  SubsetIteratorState *iter_state);
+static bitmapword get_neighbors_base(DPHypContext *context, HyperNode *node, bitmapword excluded);
 static bool hypernode_has_direct_edge_with(DPHypContext *context, HyperNode *node, int id);
 static bool hypernode_has_edge_with(DPHypContext *context, HyperNode *node, bitmapword bms);
 static void emit_csg_cmp(DPHypContext *context, HyperNode *subgroup,
@@ -243,15 +237,10 @@ static RelOptInfo *dphyp(DPHypContext *context, PlannerInfo *root, List *initial
 static RelOptInfo *hypernode_get_rel(DPHypContext *context, HyperNode *node);
 static RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed,
 									 List *initial_rels);
-static void neighborhood_cache_init(NeighborhoodCache *cache, bitmapword subgroup);
-static bitmapword neighborhood_cache_begin(NeighborhoodCache *cache, bitmapword subgroup,
-										   bitmapword *saved_neighborhood);
-static void neighborhood_cache_end(NeighborhoodCache *cache, bitmapword subgroup,
-								   bitmapword neighborhood);
 static void compute_start_index(DPHypContext *context);
 static int get_start_index(EdgeArray *edges, bitmapword bmw);
 static void subset_iterator_init(SubsetIteratorState *state, bitmapword bmw);
-static bool subset_iterator_next(SubsetIteratorState *state, bitmapword *result);
+static bool subset_iterator_next(SubsetIteratorState *state);
 
 Datum
 pg_dphyp_get_statistics(PG_FUNCTION_ARGS)
@@ -336,87 +325,60 @@ contains_sj(PlannerInfo *root)
 	return root->join_info_list != NIL;
 }
 
-static void
-neighborhood_cache_init(NeighborhoodCache *cache, bitmapword subgroup)
-{
-	/* Special value in order to not use cache at first iteration */
-	cache->last_grow = ~0;
-	cache->last_neighborhood = 0;
-	cache->sentinel = bmw_first(subgroup);
-}
-
 static bitmapword
-neighborhood_cache_begin(NeighborhoodCache *cache, bitmapword grown_by,
-						 bitmapword *saved_neighborhood)
-{
-	bitmapword to_search;
-	bitmapword neighborhood;
-
-	if (bmw_is_subset(cache->last_grow, grown_by))
-	{
-		/*
-		 * We can start search from last known neighborhood,
-		 * just iterate over unseen base nodes.
-		 */
-		neighborhood = cache->last_neighborhood;
-		to_search = grown_by & ~cache->last_grow;
-	}
-	else
-	{
-		/*
-		 * Have to iterate over all base nodes
-		 */
-		neighborhood = 0;
-		to_search = grown_by;
-	}
-
-	*saved_neighborhood = neighborhood;
-	return to_search;
-}
-
-static void
-neighborhood_cache_end(NeighborhoodCache *cache, bitmapword grown_by,
-					   bitmapword neighborhood)
-{
-	if (bmw_overlap(grown_by, cache->sentinel))
-	{
-		/* Prevent multiple cache invalidations */
-		return;
-	}
-
-	cache->last_grow = grown_by;
-	cache->last_neighborhood = neighborhood;
-}
-
-/*
- * Get gitmap of neighbors for node excluding all specified.
- * Corresponds to 'N(S, X)' function in paper.
- */
-static bitmapword
-get_neighbors(DPHypContext *context, HyperNode *node, bitmapword excluded,
-			  bitmapword grown_by, NeighborhoodCache *cache)
+get_neighbors_delta(DPHypContext *context, bitmapword subgraph, bitmapword base_neighborhood, bitmapword delta,
+					bitmapword excluded)
 {
 	bitmapword neighbors;
-	bitmapword delta;
 	int idx;
 
-	/* Determine already obtained neighborhood */
-	delta = neighborhood_cache_begin(cache, grown_by, &neighbors);
+	excluded |= subgraph;
+	neighbors = bmw_difference(base_neighborhood, excluded);
 
-	/* Collect neighbors from simple edges */
-	neighbors |= node->simple_edges;
-	excluded |= node->nodes;
-	neighbors = bmw_difference(neighbors, excluded);
-
-	/* And then from complex only if they do not overlap with excluded */
 	idx = -1;
 	while ((idx = bmw_next_member(delta, idx)) >= 0)
 	{
-		EdgeArray *edges = &context->complex_edges[idx];
-		int i = get_start_index(edges, neighbors | excluded);
-		for (; i < edges->size; i++)
+		EdgeArray *complex_edges;
+		int i;
+
+		neighbors |= bmw_difference(context->simple_edges[idx], excluded);
+		
+		complex_edges = &context->complex_edges[idx];
+		i = get_start_index(complex_edges, neighbors | excluded);
+		for (; i < complex_edges->size; i++)
 		{
-			HyperEdge edge = edges->edges[i];
+			HyperEdge edge = complex_edges->edges[i];
+			if ( bmw_is_subset(edge.left, subgraph) &&
+				!bmw_overlap(edge.right, neighbors | excluded))
+			{
+				neighbors |= bmw_lowest_bit(edge.right);
+			}
+		}
+	}
+
+	neighbors = bmw_difference(neighbors, excluded);
+
+	return neighbors;
+}
+
+static bitmapword
+get_neighbors_base(DPHypContext *context, HyperNode *node, bitmapword excluded)
+{
+	bitmapword neighbors;
+	int idx;
+
+	excluded |= node->nodes;
+	neighbors = bmw_difference(node->simple_edges, excluded);
+
+	idx = -1;
+	while ((idx = bmw_next_member(node->nodes, idx)) >= 0)
+	{
+		EdgeArray *complex_edges = &context->complex_edges[idx];
+		int i;
+		i = get_start_index(complex_edges, neighbors | excluded);
+		for (; i < complex_edges->size; i++)
+		{
+			HyperEdge edge = complex_edges->edges[i];
 			if ( bmw_is_subset(edge.left, node->nodes) &&
 				!bmw_overlap(edge.right, neighbors | excluded))
 			{
@@ -425,7 +387,50 @@ get_neighbors(DPHypContext *context, HyperNode *node, bitmapword excluded,
 		}
 	}
 
-	neighborhood_cache_end(cache, grown_by, neighbors);
+	neighbors = bmw_difference(neighbors, excluded);
+
+	return neighbors;
+}
+
+/*
+ * Get bitmap of neighbors for node excluding all specified.
+ * Corresponds to 'N(S, X)' function in paper.
+ */
+static bitmapword
+get_neighbors_iter(DPHypContext *context, bitmapword subgroup,
+					bitmapword excluded, SubsetIteratorState *iter_state)
+{
+	int idx;
+	int i;
+	bitmapword neighbors;
+	EdgeArray *complex_edges;
+
+	excluded |= subgroup;
+	neighbors = iter_state->saved_neighborhood;
+
+	Assert(!bmw_is_empty(iter_state->subset));
+	idx = bmw_rightmost_one_pos(iter_state->subset);
+
+	/* Add simple neighbors */
+	neighbors |= bmw_difference(context->simple_edges[idx], excluded);
+
+	/* And from complex edges */
+	complex_edges = &context->complex_edges[idx];
+	i = get_start_index(complex_edges, neighbors | excluded);
+	for (; i < complex_edges->size; i++)
+	{
+		HyperEdge edge = complex_edges->edges[i];
+		if ( bmw_is_subset(edge.left, subgroup) &&
+			!bmw_overlap(edge.right, neighbors | excluded))
+		{
+			neighbors |= bmw_lowest_bit(edge.right);
+		}
+	}
+
+	if (iter_state->is_even)
+		iter_state->saved_neighborhood = neighbors;
+	
+	neighbors = bmw_difference(neighbors, excluded);
 
 	return neighbors;
 }
@@ -497,20 +502,25 @@ hypernode_has_edge_with(DPHypContext *context, HyperNode *node, bitmapword bmw)
 }
 
 static void
-subset_iterator_init(SubsetIteratorState *state, bitmapword bmw)
+subset_iterator_init(SubsetIteratorState *state, bitmapword base_neighborhood)
 {
-	state->init = bmw;
-	state->state = (-bmw) & bmw;
+	state->init = base_neighborhood;
+	state->state = (-base_neighborhood) & base_neighborhood;
+	state->saved_neighborhood = base_neighborhood;
+	state->subset = 0;
+	/* First iteration should not be saved - initial 'true' will prevent this */
+	state->is_even = true;
 }
 
 static bool
-subset_iterator_next(SubsetIteratorState *state, bitmapword *result)
+subset_iterator_next(SubsetIteratorState *state)
 {
 	if (state->state == 0)
 		return false;
 
-	*result = state->state;
+	state->subset = state->state;
 	state->state = (state->state - state->init) & state->init;
+	state->is_even = !state->is_even;
 	return true;
 }
 
@@ -547,18 +557,16 @@ enumerate_cmp_recursive(DPHypContext *context, HyperNode *subgraph, HyperNode *c
 						bitmapword excluded, bitmapword neighborhood)
 {
 	SubsetIteratorState subset_iter;
-	NeighborhoodCache cache;
-	bitmapword subset;
 
 	if (bmw_is_empty(neighborhood))
 		return;
 
 	subset_iterator_init(&subset_iter, neighborhood);
-	while (subset_iterator_next(&subset_iter, &subset))
+	while (subset_iterator_next(&subset_iter))
 	{
 		HyperNode *expanded_complement;
 
-		expanded_complement = get_hypernode(context, complement->nodes | subset);
+		expanded_complement = get_hypernode(context, complement->nodes | subset_iter.subset);
 
 		if (hypernode_has_rel(expanded_complement) &&
 			hypernode_has_edge_with(context, subgraph, expanded_complement->nodes))
@@ -567,15 +575,14 @@ enumerate_cmp_recursive(DPHypContext *context, HyperNode *subgraph, HyperNode *c
 
 	excluded |= neighborhood;
 
-	neighborhood_cache_init(&cache, neighborhood);
 	subset_iterator_init(&subset_iter, neighborhood);
-	while (subset_iterator_next(&subset_iter, &subset))
+	while (subset_iterator_next(&subset_iter))
 	{
 		HyperNode *expanded_complement;
 		bitmapword current_neighborhood;
-		expanded_complement = get_hypernode(context, complement->nodes | subset);
-		current_neighborhood = get_neighbors(context, expanded_complement,
-											 excluded, subset, &cache);
+		expanded_complement = get_hypernode(context, complement->nodes | subset_iter.subset);
+		current_neighborhood = get_neighbors_iter(context, expanded_complement->nodes,
+											 	  excluded, &subset_iter);
 
 		enumerate_cmp_recursive(context, subgraph, expanded_complement,
 								excluded, current_neighborhood);
@@ -587,7 +594,6 @@ static void
 emit_csg(DPHypContext *context, HyperNode *subgraph, bitmapword neighborhood)
 {
 	bitmapword excluded;
-	NeighborhoodCache cache;
 	int i;
 
 	if (bmw_is_empty(neighborhood))
@@ -596,7 +602,6 @@ emit_csg(DPHypContext *context, HyperNode *subgraph, bitmapword neighborhood)
 	excluded = subgraph->nodes | bmw_all_bit_set(subgraph->representative);
 
 	i = -1;
-	neighborhood_cache_init(&cache, neighborhood);
 	while ((i = bmw_prev_member(neighborhood, i)) >= 0)
 	{
 		HyperNode *complement;
@@ -620,8 +625,7 @@ emit_csg(DPHypContext *context, HyperNode *subgraph, bitmapword neighborhood)
 		 * and execution time will skyrocket.
 		 */
 		excluded_ext = excluded | (neighborhood & bmw_all_bit_set(i));
-		complement_neighborhood = get_neighbors(context, complement, excluded_ext,
-												complement->nodes, &cache);
+		complement_neighborhood = get_neighbors_base(context, complement, excluded_ext);
 		enumerate_cmp_recursive(context, subgraph, complement, excluded_ext,
 								complement_neighborhood);
 	}
@@ -632,41 +636,38 @@ emit_csg(DPHypContext *context, HyperNode *subgraph, bitmapword neighborhood)
  */
 static void
 enumerate_csg_recursive(DPHypContext *context, HyperNode *subgraph,
-						bitmapword excluded, bitmapword neighborhood)
+						bitmapword excluded, bitmapword subgraph_neighborhood)
 {
 	SubsetIteratorState subset_iter;
-	bitmapword subset;
-	NeighborhoodCache cache;
 
-	if (bmw_is_empty(neighborhood))
+	if (bmw_is_empty(subgraph_neighborhood))
 		return;
 
-	neighborhood_cache_init(&cache, neighborhood);
-	subset_iterator_init(&subset_iter, neighborhood);
-	while (subset_iterator_next(&subset_iter, &subset))
+	subset_iterator_init(&subset_iter, subgraph_neighborhood);
+	while (subset_iterator_next(&subset_iter))
 	{
 		HyperNode *expanded_subgraph;
 
-		expanded_subgraph = get_hypernode(context, subgraph->nodes | subset);
+		expanded_subgraph = get_hypernode(context, subgraph->nodes | subset_iter.subset);
 		if (hypernode_has_rel(expanded_subgraph))
 		{
-			bitmapword subnode_neighbors = get_neighbors(context, expanded_subgraph,
-														 excluded, subset, &cache);
+			bitmapword subnode_neighbors = get_neighbors_delta(context, expanded_subgraph->nodes, 
+															   subgraph_neighborhood, subset_iter.subset, excluded);
 			emit_csg(context, expanded_subgraph, subnode_neighbors);
 		}
 	}
 
-	excluded |= neighborhood;
+	excluded |= subgraph_neighborhood;
 
-	subset_iterator_init(&subset_iter, neighborhood);
-	while (subset_iterator_next(&subset_iter, &subset))
+	subset_iterator_init(&subset_iter, subgraph_neighborhood);
+	while (subset_iterator_next(&subset_iter))
 	{
 		bitmapword current_neighborhood;
 		HyperNode *expanded_subgraph;
 
-		expanded_subgraph = get_hypernode(context, subgraph->nodes | subset);
-		current_neighborhood = get_neighbors(context, expanded_subgraph, excluded,
-											 subset, &cache);
+		expanded_subgraph = get_hypernode(context, subgraph->nodes | subset_iter.subset);
+		current_neighborhood = get_neighbors_iter(context, expanded_subgraph->nodes,
+												  excluded, &subset_iter);
 		enumerate_csg_recursive(context, expanded_subgraph, excluded,
 								current_neighborhood);
 	}
@@ -683,15 +684,12 @@ solve(DPHypContext *context)
 	 */
 	for (int i = base_hypernodes_count - 1; i >= 0; i--)
 	{
-		NeighborhoodCache cache;
 		bitmapword neighborhood;
 		bitmapword excluded;
 		HyperNode *subgraph = (HyperNode *) list_nth(context->base_hypernodes, i);
 
-		neighborhood_cache_init(&cache, 0);
 		excluded = bmw_all_bit_set(i);
-		neighborhood = get_neighbors(context, subgraph, excluded,
-									 subgraph->nodes, &cache);
+		neighborhood = get_neighbors_base(context, subgraph, excluded);
 		emit_csg(context, subgraph, neighborhood);
 		enumerate_csg_recursive(context, subgraph, excluded, neighborhood);
 
@@ -1578,7 +1576,7 @@ dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	List *disjoint_rels;
 
 	if (!dphyp_enabled ||
-		BITS_PER_BITMAPWORD <= levels_needed ||
+		BITS_PER_BITMAPWORD <= list_length(initial_rels) ||
 		(dphyp_skip_sj && contains_sj(root)))
 	{
 		if (prev_join_search_hook)
