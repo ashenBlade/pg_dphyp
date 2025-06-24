@@ -15,6 +15,10 @@
 
 #include "simplebms.h"
 
+#if PG_MAJORVERSION_NUM < 13
+#define generate_useful_gather_paths(x,y,z) generate_gather_paths(z,y,z)
+#endif
+
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(pg_dphyp_get_statistics);
@@ -749,17 +753,20 @@ map_to_internal_bms(List *initial_rels, Bitmapset *original)
 {
 	bitmapword target;
 	ListCell *lc;
+	int i;
 
 	/* 
 	 * We must iterate over initial_rels, because RelOptInfo
 	 * can represent join, thus it's 'relids' is not singleton.
 	 */
 	target = 0;
+	i = 0;
 	foreach(lc, initial_rels)
 	{
 		RelOptInfo *rel = (RelOptInfo *)lfirst(lc);
 		if (bms_is_subset(rel->relids, original))
-			target = bmw_add_member(target, foreach_current_index(lc));
+			target = bmw_add_member(target, i);
+		++i;
 	}
 
 	return target;
@@ -864,7 +871,11 @@ loop_end:
 	}
 
 	generate_partitionwise_join_paths(context->root, final_rel);
+#if PG_MAJORVERSION_NUM < 16
+    if (!bms_equal(context->root->all_baserels, final_rel->relids))
+#else	
     if (!bms_equal(context->root->all_query_rels, final_rel->relids))
+#endif
 		generate_useful_gather_paths(context->root, final_rel, false);
 	set_cheapest(final_rel);
 	node->rel = final_rel;
@@ -877,6 +888,7 @@ initialize_hypernodes(DPHypContext *context)
 	ListCell *lc;
 	HTAB *dptable;
 	HASHCTL hctl;
+	int i;
 
 	/* Initial size of HTAB given from 'build_join_rel_hash' */
 	hctl.keysize = sizeof(bitmapword);
@@ -886,7 +898,7 @@ initialize_hypernodes(DPHypContext *context)
 	hctl.hcxt = CurrentMemoryContext;
 	dptable = (HTAB *)hash_create("DPhyp hypernode table", 256L, &hctl,
 								  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
-
+	i = 0;
 	foreach (lc, context->initial_rels)
 	{
 		RelOptInfo *rel = (RelOptInfo *)lfirst(lc);
@@ -894,18 +906,19 @@ initialize_hypernodes(DPHypContext *context)
 		bitmapword set;
 		bool found;
 
-		set = bmw_make_singleton(foreach_current_index(lc));
+		set = bmw_make_singleton(i);
 		entry = (HyperNode *) hash_search(dptable, &set, HASH_ENTER, &found);
 
 		Assert(!found);
 
 		entry->rel = rel;
 		entry->candidates = NIL;
-		entry->representative = foreach_current_index(lc);
+		entry->representative = i;
 		entry->set = set;
-		entry->simple_edges = context->simple_edges[foreach_current_index(lc)];
+		entry->simple_edges = context->simple_edges[i];
 
 		context->base_hypernodes = lappend(context->base_hypernodes, entry);
+		++i;
 	}
 
 	context->dptable = dptable;
@@ -1703,7 +1716,11 @@ _PG_init(void)
 							 PGC_USERSET,
 					 		 0, NULL, NULL, NULL);
 
+#if PG_MAJORVERSION_NUM < 15
+	EmitWarningsOnPlaceholders("pg_dphyp");
+#else
 	MarkGUCPrefixReserved("pg_dphyp");
+#endif
 
 	prev_join_search_hook = join_search_hook;
 	join_search_hook = dphyp_join_search;

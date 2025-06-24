@@ -10,7 +10,20 @@
 
 #include "nodes/bitmapset.h"
 #include "port/pg_bitutils.h"
-#include "common/hashfn.h"
+
+#if PG_MAJORVERSION_NUM < 17
+#if BITS_PER_BITMAPWORD == 32
+#define bmw_leftmost_one_pos(w)			pg_leftmost_one_pos32(w)
+#define bmw_rightmost_one_pos(w)		pg_rightmost_one_pos32(w)
+#else
+#define bmw_leftmost_one_pos(w)			pg_leftmost_one_pos64(w)
+#define bmw_rightmost_one_pos(w)		pg_rightmost_one_pos64(w)
+#endif
+#endif
+
+#if PG_MAJORVERSION_NUM < 15
+#define pg_rotate_left32(x,k)	(((x)<<(k)) | ((x)>>(32-(k))))
+#endif
 
 #define ValidateBmwPosition(x) Assert(0 <= (x) && (x) < BITS_PER_BITMAPWORD)
 #define MAKE_BMW(x)  ((bitmapword) (1 << (x)))

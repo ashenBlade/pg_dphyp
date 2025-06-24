@@ -236,3 +236,14 @@ For example such subquery has 2 disjoint relations due to outer parameter:
 SELECT * FROM t1
 WHERE t1.x IN (SELECT t2.x FROM t2, t3 WHERE t2.x > t1.x AND t3.x <> t1.x);
 ```
+
+## Compatibility
+
+`pg_dphyp` compatible with PostgreSQL down to 12 major version including.
+
+## Testing
+
+Actually, there is no testing. Regress tests in `sql` directory required to find differences in result plan after code changes.
+
+Single file `sql/join.out` is a compilation of several regression test files located in `src/tests/regress/sql` - some for environment setup and other are tests: `join.sql`, `join_hash.sql` and `partition_join.sql`.
+These tests taken for 17 PostgreSQL - for other version tests fail due to differences in result plans and/or unsupported env variables to load data in (from `data` directory).`
