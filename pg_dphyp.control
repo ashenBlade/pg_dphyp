@@ -1,0 +1,5 @@
+# pg_dphyp extension
+comment = 'DPhyp join ordering algorithm'
+module_pathname = '$libdir/pg_dphyp'
+relocatable = true
+default_version = '1.0'
