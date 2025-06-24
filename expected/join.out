@@ -110,7 +110,7 @@ CREATE TABLE onek (
 	stringu2	name,
 	string4		name
 );
-\set filename :abs_srcdir '/data/onek.data'
+\set filename :abs_srcdir '/../../src/test/regress/data/onek.data'
 COPY onek FROM :'filename';
 VACUUM ANALYZE onek;
 CREATE TABLE onek2 AS SELECT * FROM onek;
@@ -133,7 +133,7 @@ CREATE TABLE tenk1 (
 	stringu2	name,
 	string4		name
 );
-\set filename :abs_srcdir '/data/tenk.data'
+\set filename :abs_srcdir '/../../src/test/regress/data/tenk.data'
 COPY tenk1 FROM :'filename';
 VACUUM ANALYZE tenk1;
 CREATE TABLE tenk2 AS SELECT * FROM tenk1;
@@ -143,20 +143,20 @@ CREATE TABLE person (
 	age			int4,
 	location 	point
 );
-\set filename :abs_srcdir '/data/person.data'
+\set filename :abs_srcdir '/../../src/test/regress/data/person.data'
 COPY person FROM :'filename';
 VACUUM ANALYZE person;
 CREATE TABLE emp (
 	salary 		int4,
 	manager 	name
 ) INHERITS (person);
-\set filename :abs_srcdir '/data/emp.data'
+\set filename :abs_srcdir '/../../src/test/regress/data/emp.data'
 COPY emp FROM :'filename';
 VACUUM ANALYZE emp;
 CREATE TABLE student (
 	gpa 		float8
 ) INHERITS (person);
-\set filename :abs_srcdir '/data/student.data'
+\set filename :abs_srcdir '/../../src/test/regress/data/student.data'
 COPY student FROM :'filename';
 VACUUM ANALYZE student;
 CREATE TABLE stud_emp (
@@ -165,14 +165,14 @@ CREATE TABLE stud_emp (
 NOTICE:  merging multiple inherited definitions of column "name"
 NOTICE:  merging multiple inherited definitions of column "age"
 NOTICE:  merging multiple inherited definitions of column "location"
-\set filename :abs_srcdir '/data/stud_emp.data'
+\set filename :abs_srcdir '/../../src/test/regress/data/stud_emp.data'
 COPY stud_emp FROM :'filename';
 VACUUM ANALYZE stud_emp;
 CREATE TABLE road (
 	name		text,
 	thepath 	path
 );
-\set filename :abs_srcdir '/data/streets.data'
+\set filename :abs_srcdir '/../../src/test/regress/data/streets.data'
 COPY road FROM :'filename';
 VACUUM ANALYZE road;
 CREATE TABLE ihighway () INHERITS (road);
