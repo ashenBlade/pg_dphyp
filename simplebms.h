@@ -45,22 +45,6 @@ bmw_add_member(bitmapword bmw, int x)
 	return bmw | MAKE_BMW(x);
 }
 
-
-static inline bitmapword
-bmw_intersect(bitmapword a, bitmapword b)
-{
-	return a & b;
-}
-
-/* 
- * Union 2 bitmapwords into 1
- */
-static inline bitmapword
-bmw_union(bitmapword a, bitmapword b)
-{
-	return a | b;
-}
-
 /* 
  * Get all elements from 'a' without elements from 'b'
  */
@@ -77,15 +61,6 @@ static inline bool
 bmw_is_subset(bitmapword a, bitmapword b)
 {
 	return (a & b) == a;
-}
-
-/* 
- * Check 2 bitmapwords are equal
- */
-static inline bool
-bmw_equal(bitmapword a, bitmapword b)
-{
-	return a == b;
 }
 
 /* 
