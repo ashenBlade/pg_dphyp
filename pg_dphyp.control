@@ -2,4 +2,4 @@
 comment = 'DPhyp join ordering algorithm'
 module_pathname = '$libdir/pg_dphyp'
 relocatable = true
-default_version = '1.0'
+default_version = '0.1'
