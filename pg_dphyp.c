@@ -214,6 +214,18 @@ static bool dphyp_enabled = true;
  * decide how to handle them.
  */
 static int dphyp_cj_strategy = CJ_STRATEGY_PASS;
+/* Minimal number of tables to run DPhyp */
+static int dphyp_min_relations = 0;
+/* Maximal number of table after which GEQO is used */
+static int dphyp_max_relations = 16;
+/* 
+ * Whether we should count number of connected subgraphs.
+ * This can be useful, if cc_threshold is disabled, but
+ * hash table preallocation can give improvements.
+ */
+static bool dphyp_count_cc = true;
+/* If this amount is hit, then run GEQO */
+static int dphyp_geqo_cc_threshold = 10000;
 
 static join_search_hook_type prev_join_search_hook = NULL;
 
@@ -1712,7 +1724,6 @@ dphyp(DPHypContext *context, PlannerInfo *root, List *initial_rels)
 	HyperNode *result;
 	bitmapword all_query_nodes;
 	uint64 subgraphs_count;
-	uint64 subgraphs_threshold;
 
 	context->initial_rels = initial_rels;
 	context->root = root;
@@ -1720,20 +1731,21 @@ dphyp(DPHypContext *context, PlannerInfo *root, List *initial_rels)
 	
 	initialize_edges(root, initial_rels, context);
 
-	/* 
-	 * Threshold value from original paper is 10000, but this is
-	 * rounded to power of 2 for beauty.
-	 */
-	subgraphs_threshold = 10240;
-	subgraphs_count = count_cc(context, subgraphs_threshold);
-	if (subgraphs_count >= subgraphs_threshold)
-		return NULL;
+	if (dphyp_geqo_cc_threshold != 0 || dphyp_count_cc)
+	{
+		subgraphs_count = count_cc(context, dphyp_geqo_cc_threshold);
+		if (dphyp_geqo_cc_threshold != 0 && subgraphs_count >= dphyp_geqo_cc_threshold)
+			return NULL;
+	}
+	else
+	{
+		/* Default safe value */
+		subgraphs_count = 256;
+	}
 
 	initialize_hypernodes(context, subgraphs_count);
-	elog(NOTICE, "Subgraphs: %lu", subgraphs_count);
 
 	solve(context);
-	elog(NOTICE, "Result size is: %li", hash_get_num_entries(context->dptable));
 
 	all_query_nodes = bmw_all_bit_set(list_length(initial_rels) - 1);
 	result = hash_search(context->dptable, &all_query_nodes, HASH_FIND, NULL);
@@ -1752,7 +1764,9 @@ dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	List *disjoint_rels;
 
 	if (!dphyp_enabled ||
-		BITS_PER_BITMAPWORD <= list_length(initial_rels))
+		BITS_PER_BITMAPWORD <= list_length(initial_rels) ||
+		list_length(initial_rels) < dphyp_min_relations ||
+		dphyp_max_relations <= list_length(initial_rels))
 	{
 		if (prev_join_search_hook)
 			return prev_join_search_hook(root, levels_needed, initial_rels);
@@ -1819,7 +1833,41 @@ _PG_init(void)
 							 cross_join_strategy_options,
 							 PGC_USERSET,
 					 		 0, NULL, NULL, NULL);
-
+	DefineCustomIntVariable("pg_dphyp.min_relations",
+							"Minimal amount of relations in single join search "
+							"run to run DPhyp, otherwise run DPsize",
+							NULL,
+							&dphyp_min_relations,
+							dphyp_min_relations,
+							0, BITS_PER_BITMAPWORD,
+							PGC_USERSET,
+							0, NULL, NULL, NULL);
+	DefineCustomIntVariable("pg_dphyp.max_relations",
+							"Maximal amount of relations in single join search "
+							"run after which GEQO is used (acts like geqo_threshold).",
+							NULL,
+							&dphyp_min_relations,
+							dphyp_min_relations,
+							0, BITS_PER_BITMAPWORD,
+							PGC_USERSET,
+							0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_dphyp.count_cc",
+							 "Count number of connected subgraphs in graph and "
+							 "use this value to preallocate hash table.",
+							 NULL,
+							 &dphyp_count_cc,
+							 dphyp_count_cc,
+							 PGC_USERSET,
+							 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("pg_dphyp.geqo_cc_threshold",
+							"Amount of connected subgraphs after which GEQO will "
+							"be used. Set to 0 to switch off.",
+							NULL,
+							&dphyp_geqo_cc_threshold,
+							dphyp_geqo_cc_threshold,
+							0, INT32_MAX,
+							PGC_USERSET,
+							0, NULL, NULL, NULL);
 #if PG_MAJORVERSION_NUM < 15
 	EmitWarningsOnPlaceholders("pg_dphyp");
 #else

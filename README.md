@@ -35,7 +35,7 @@ shared_preload_libraries = 'pg_dphyp'
 
 ## GUC
 
-There are 2 GUC settings:
+There are 5 GUC settings:
 
 1. `pg_dphyp.enabled` (boolean) - controls whether algorithm is enabled. It is `on` by default
 2. `pg_dphyp.cj_strategy` (enum) - controls behavior of algorithm related to presence of cross joins:
@@ -43,6 +43,10 @@ There are 2 GUC settings:
     - `no` - no actions are taken, if algorithm failed to build final JOIN relation, then DPsize/GEQO is called
     - `pass` - if algorithm failed to build JOIN relation, then it tries to find all built JOIN relations groups (disjoint relation sets) and pass them to DPsize/GEQO (thus we do not throw away done work)
     - `detect` - try to find all disjoint relation sets before algorithm is run and create hyperedges for them. If algorithm still fails to create final JOIN relation, then DPsize/GEQO is called
+3. `pg_dphyp.min_relations` (int) - minimal number of relations passed to single join search run after which DPhyp will be used. Default is `0`, so it's always enabled.
+4. `pg_dphyp.max_relations` (int) - maximal number (including) of relations passed to single join search run after which GEQO will be used, so acts like `geqo_threshold`. Default is `16`.
+5. `pg_dphyp.count_cc` (boolean) - count number of connected subgraphs and use this value to preallocate hash table. This can give some performance improvements.
+6. `pg_dphyp.geqo_cc_threshold` (int) - maximal number of connected subgraphs after which GEQO will be run. If value is `0`, then it's off and no checks are performed, otherwise number of connected subgraphs will be counted and used without taking into account `count_cc` GUC. Default is `10000`.
 
 ## Implementation
 
@@ -222,6 +226,17 @@ For second case we don't have `excluded` set, but instead right hypernode is fix
 Idea is the same - 'right' edge will definitely not be subset if it has relations less than minimal from that tested hypernode.
 
 For example, if `right` hypernode is `1000`, then index obtained from `start_index` is `4`.
+
+### Connected subgraphs count
+
+Paper ["Adaptive Optimization of Very Large Join Queries"](https://db.in.tum.de/~radke/papers/hugejoins.pdf) gives good heuristic estimation for DPhyp applicability - decision should be based on graph complexity, not on amount of tables.
+This paper also gives function to calculate amount of connected subgraphs: `count_cc` (entrypoint) and `count_cc_rec` (recursive calculation).
+
+It can be used not only to check whether DPhyp running is pragmatic, but also gives amount of *total subgraphs in dptable*, so we can also use it.
+In extension this is controlled by 2 GUC `pg_dphyp.count_cc` (enable/disable) and `pg_dphyp.geqo_cc_threshold` (threshold after which GEQO is run).
+
+There is another observation - we can effectively count this amount, just because we found way before in [optimal neighborhood subset iteration](#optimal-neighborhood-subset-iteration).
+So calculation of this function is also effective.
 
 ## Known problems
 
