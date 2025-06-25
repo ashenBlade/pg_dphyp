@@ -225,10 +225,14 @@ static void initialize_edges(PlannerInfo *root, List *initial_rels,
 							 DPHypContext *context);
 static void distribute_cjs(DPHypContext *context, bitmapword cjs);
 static void distribute_hyperedge(DPHypContext *context, HyperEdge edge);
-static void initialize_hypernodes(DPHypContext *context);
+static void initialize_hypernodes(DPHypContext *context, uint64 subgraphs_count);
 static void hyperedge_array_add(EdgeArray *array, HyperEdge edge);
 static void compute_start_index(DPHypContext *context);
 static HyperEdge hyperedge_swap(HyperEdge edge);
+static uint64 count_cc(DPHypContext *context, uint64 max);
+static uint64 count_cc_recursive(DPHypContext *context, bitmapword set,
+								 bitmapword excluded, uint64 count, uint64 budget,
+								 bitmapword base_neighborhood);
 
 /* Runtime */
 static HyperNode *get_hypernode(DPHypContext *context, bitmapword nodes);
@@ -237,6 +241,7 @@ static bool subset_iterator_next(SubsetIteratorState *state);
 static bitmapword get_neighbors_iter(DPHypContext *context, bitmapword subgroup, bitmapword excluded,
 									  SubsetIteratorState *iter_state);
 static bitmapword get_neighbors(DPHypContext *context, HyperNode *node, bitmapword excluded);
+static bitmapword get_neighbors_base(DPHypContext *context, int id, bitmapword excluded);
 static int get_start_index(EdgeArray *edges, bitmapword bmw);
 static bool hypernode_has_direct_edge_with(DPHypContext *context, HyperNode *node, int id);
 static bool hypernode_has_edge_with(DPHypContext *context, HyperNode *node, bitmapword bms);
@@ -323,6 +328,36 @@ static inline bool
 hypernode_has_rel(HyperNode *node)
 {
 	return node->rel != NULL || node->candidates != NIL;
+}
+
+/* Collect neighborhood for single base node */
+static bitmapword
+get_neighbors_base(DPHypContext *context, int id, bitmapword excluded)
+{
+	bitmapword neighborhood;
+	EdgeArray *edges;
+	bitmapword set;
+
+	set = bmw_make_singleton(id);
+	neighborhood = context->simple_edges[id];
+
+	edges = &context->complex_edges[id];
+	if (edges->size > 0)
+	{
+		int i = get_start_index(edges, excluded);
+		for (; i < edges->size; ++i)
+		{
+			HyperEdge edge = edges->edges[i];
+			if ( edge.left == set &&
+				!bmw_overlap(edge.right, neighborhood | excluded))
+			{
+				neighborhood |= bmw_lowest_bit(edge.right);
+			}		
+		}
+	}
+
+	neighborhood = bmw_difference(neighborhood, excluded);
+	return neighborhood;
 }
 
 /*
@@ -662,7 +697,7 @@ emit_csg(DPHypContext *context, HyperNode *subgraph, bitmapword neighborhood)
 		 * and execution time will skyrocket.
 		 */
 		excluded_ext = excluded | (neighborhood & bmw_all_bit_set(i));
-		complement_neighborhood = get_neighbors(context, complement, excluded_ext);
+		complement_neighborhood = get_neighbors_base(context, i, excluded_ext);
 		if (!bmw_is_empty(complement_neighborhood))
 			enumerate_cmp_recursive(context, subgraph, complement, excluded_ext,
 									complement_neighborhood);
@@ -729,7 +764,7 @@ solve(DPHypContext *context)
 		HyperNode *subgraph = (HyperNode *) list_nth(context->base_hypernodes, i);
 
 		excluded = bmw_all_bit_set(i);
-		neighborhood = get_neighbors(context, subgraph, excluded);
+		neighborhood = get_neighbors_base(context, i, excluded);
 
 		if (!bmw_is_empty(neighborhood))
 		{
@@ -883,7 +918,7 @@ loop_end:
 }
 
 static void
-initialize_hypernodes(DPHypContext *context)
+initialize_hypernodes(DPHypContext *context, uint64 subgraphs_count)
 {
 	ListCell *lc;
 	HTAB *dptable;
@@ -896,7 +931,7 @@ initialize_hypernodes(DPHypContext *context)
 	hctl.hash = bmw_hash;
 	hctl.match = bmw_match;
 	hctl.hcxt = CurrentMemoryContext;
-	dptable = (HTAB *)hash_create("DPhyp hypernode table", 256L, &hctl,
+	dptable = (HTAB *)hash_create("DPhyp hypernode table", subgraphs_count, &hctl,
 								  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
 	i = 0;
 	foreach (lc, context->initial_rels)
@@ -1616,20 +1651,89 @@ initialize_edges(PlannerInfo *root, List *initial_rels, DPHypContext *context)
 	compute_start_index(context);
 }
 
+
+static uint64
+count_cc_recursive(DPHypContext *context, bitmapword subgraph, bitmapword excluded,
+				   uint64 count, uint64 max, bitmapword base_neighborhood)
+{
+	SubsetIteratorState subset_iter;
+	subset_iterator_init(&subset_iter, base_neighborhood);
+	while (subset_iterator_next(&subset_iter))
+    {
+		bitmapword set;
+		bitmapword excluded_ext;
+		bitmapword neighborhood;
+	
+		count++;
+		if (count > max)
+			break;
+
+		excluded_ext = excluded | base_neighborhood;
+		set = subgraph | subset_iter.subset;
+		neighborhood = get_neighbors_iter(context, set, excluded_ext, &subset_iter);
+		count = count_cc_recursive(context, set, excluded_ext, count, max, neighborhood);
+	}
+
+	return count;
+}
+
+/* 
+ * Count number of connected subgraphs for this graph.
+ * Function taken from "Adaptive Optimization of Very Large Join Queries".
+ */
+static uint64
+count_cc(DPHypContext *context, uint64 max)
+{
+	int64 count = 0;
+	int rels_count;
+
+	rels_count = list_length(context->initial_rels);
+	for (size_t i = 0; i < rels_count; i++)
+	{
+		bitmapword excluded;
+		bitmapword neighborhood;
+
+		count++;
+		if (count > max)
+			break;
+
+		excluded = bmw_all_bit_set(i);
+		neighborhood = get_neighbors_base(context, i, excluded);
+		count = count_cc_recursive(context, bmw_make_singleton(i), excluded,
+								   count, max, neighborhood);
+	}
+
+	return count;
+}
+
 static RelOptInfo *
 dphyp(DPHypContext *context, PlannerInfo *root, List *initial_rels)
 {
 	HyperNode *result;
 	bitmapword all_query_nodes;
+	uint64 subgraphs_count;
+	uint64 subgraphs_threshold;
 
 	context->initial_rels = initial_rels;
 	context->root = root;
 	context->base_hypernodes = NIL;
+	
 	initialize_edges(root, initial_rels, context);
 
-	initialize_hypernodes(context);
+	/* 
+	 * Threshold value from original paper is 10000, but this is
+	 * rounded to power of 2 for beauty.
+	 */
+	subgraphs_threshold = 10240;
+	subgraphs_count = count_cc(context, subgraphs_threshold);
+	if (subgraphs_count >= subgraphs_threshold)
+		return NULL;
+
+	initialize_hypernodes(context, subgraphs_count);
+	elog(NOTICE, "Subgraphs: %lu", subgraphs_count);
 
 	solve(context);
+	elog(NOTICE, "Result size is: %li", hash_get_num_entries(context->dptable));
 
 	all_query_nodes = bmw_all_bit_set(list_length(initial_rels) - 1);
 	result = hash_search(context->dptable, &all_query_nodes, HASH_FIND, NULL);
