@@ -42,10 +42,10 @@ bmw_make_singleton(int x)
  * Create bitmapword with all bits prior to 'x' position set
  */
 static inline bitmapword
-bmw_all_bit_set(int x)
+bmw_make_b_v(int x)
 {
 	ValidateBmwPosition(x);
-	return ((bitmapword)(1 << (x + 1))) - 1;
+	return (((bitmapword)(1 << x)) - 1) | MAKE_BMW(x);
 }
 
 /* 
